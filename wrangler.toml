@@ -1,0 +1,20 @@
+name = "pickleball-bot"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Cron fires every 15 minutes; worker code checks Pacific local time and only
+# acts at the configured slots (Wed 7pm, Wed 9:30pm, Thu 5:15am, Thu 8am).
+# This keeps a single cron entry and makes daylight-saving handling automatic.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# KV namespace for roster/standby state.
+# Create it with:  npx wrangler kv namespace create PICKLE_KV
+# then paste the generated id below (or create it in the Cloudflare dashboard).
+[[kv_namespaces]]
+binding = "PICKLE_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Secrets (set these via dashboard, or:  npx wrangler secret put <NAME>):
+#   TELEGRAM_BOT_TOKEN  - from @BotFather
+#   WEBHOOK_SECRET      - any random string; also passed to setWebhook
