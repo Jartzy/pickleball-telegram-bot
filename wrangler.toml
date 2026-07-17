@@ -13,7 +13,7 @@ crons = ["*/15 * * * *"]
 # then paste the generated id below (or create it in the Cloudflare dashboard).
 [[kv_namespaces]]
 binding = "PICKLE_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "f3ec8e0c3cbd438fbcedff28beec9f41"
 
 # Secrets (set these via dashboard, or:  npx wrangler secret put <NAME>):
 #   TELEGRAM_BOT_TOKEN  - from @BotFather

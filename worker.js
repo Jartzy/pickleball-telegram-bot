@@ -253,6 +253,47 @@ function rosterText(week) {
   return lines.join('\n');
 }
 
+function signupPageHtml(week, done) {
+  const courts = groupPlayersIntoCourts(week.players);
+  let b = '';
+  if (done) b += `<p class="msg">${esc(done)}</p>`;
+  b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</h1>`;
+  if (courts.length === 0) b += `<p><i>Nobody signed up yet — be the first!</i></p>`;
+  for (const c of courts) {
+    b += c.isConfirmed
+      ? `<h2>✅ Court ${c.courtNumber} (CONFIRMED)</h2>`
+      : `<h2>⏳ Waitlist / Filling Court ${c.courtNumber}</h2>`;
+    b += '<ol>';
+    for (const p of c.players) b += `<li>${displayName(p)}</li>`;
+    b += '</ol>';
+    if (!c.isConfirmed) {
+      const n = c.playersNeeded;
+      b += `<p class="need">Needs ${n} more player${n === 1 ? '' : 's'} to unlock this court</p>`;
+    }
+  }
+  b += `<p>👥 ${week.players.length} signed up</p>`;
+  b += `<form method="POST" action="/signup" class="f">
+    <input name="name" placeholder="Your name" required maxlength="40" autocomplete="name"/>
+    <div class="btns">
+      <button name="action" value="in" class="in">✅ I'm in</button>
+      <button name="action" value="out" class="out">❌ I'm out</button>
+    </div></form>`;
+  return `<!doctype html><html><head><meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Pickleball Sign-Up</title><style>
+  body{font-family:-apple-system,system-ui,sans-serif;max-width:480px;margin:0 auto;padding:20px;color:#111;background:#fafafa}
+  h1{font-size:1.3rem}h2{font-size:1.05rem;margin:16px 0 4px}
+  ol{margin:4px 0;padding-left:24px}li{margin:2px 0}
+  .need{color:#b45309;font-size:.9rem;margin:2px 0}
+  .msg{background:#dcfce7;padding:10px;border-radius:8px}
+  .f{margin-top:24px;padding-top:16px;border-top:1px solid #ddd}
+  input{width:100%;padding:12px;font-size:1rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
+  .btns{display:flex;gap:10px;margin-top:10px}
+  button{flex:1;padding:12px;font-size:1rem;border:0;border-radius:8px;color:#fff;cursor:pointer}
+  .in{background:#16a34a}.out{background:#dc2626}
+  </style></head><body>${b}</body></html>`;
+}
+
 /** Edits the live roster message in place; falls back to posting a new one. */
 async function refreshRoster(env, chatId, week, { repost = false } = {}) {
   const text = rosterText(week);
@@ -634,6 +675,76 @@ export default {
         console.log(`update error: ${err.stack || err.message}`);
       }
       return new Response('ok'); // always 200 so Telegram doesn't retry-loop
+    }
+
+    // --- Testing: manually fire a scheduled slot ---
+    // GET /run?slot=rollcall&key=YOUR_WEBHOOK_SECRET
+    if (url.pathname === '/run') {
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const slot = url.searchParams.get('slot');
+      const valid = CONFIG.slots.map((s) => s.id);
+      if (!valid.includes(slot)) {
+        return new Response(`bad slot; use one of: ${valid.join(', ')}`, { status: 400 });
+      }
+      await runSlot(env, slot, new Date());
+      return new Response(`ran slot: ${slot}`, { status: 200 });
+    }
+
+    // --- Testing: wipe the current week's roster ---
+    // GET /reset?key=YOUR_WEBHOOK_SECRET
+    if (url.pathname === '/reset') {
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const date = activeGameDate(new Date());
+      const week = await getWeek(env, date);
+      week.phase = 'open';
+      week.players = [];
+      await saveWeek(env, week);
+      // Reflect the wipe in the live roster message if a chat is bound.
+      const chatConf = await kvGet(env, 'chat');
+      if (chatConf) await refreshRoster(env, chatConf.chatId, week);
+      return new Response(`reset week: ${date}`, { status: 200 });
+    }
+
+    // Public web sign-up page — shares the Telegram roster
+    if (url.pathname === '/signup') {
+      const chatConf = await kvGet(env, 'chat');
+      if (!chatConf) return new Response('Bot not set up yet.', { status: 503 });
+      const week = await getWeek(env, activeGameDate(new Date()));
+
+      if (request.method === 'POST') {
+        const form = await request.formData();
+        const name = (form.get('name') || '').toString().trim().slice(0, 40);
+        const action = (form.get('action') || '').toString();
+        let msg = '';
+        if (name) {
+          const key = `w:${name.toLowerCase()}`;
+          const idx = week.players.findIndex((p) => p.key === key);
+          if (action === 'in' && idx === -1) {
+            week.players.push({ key, name });
+            await saveWeek(env, week);
+            await refreshRoster(env, chatConf.chatId, week);
+            msg = `You're in, ${name}!`;
+          } else if (action === 'out' && idx !== -1) {
+            week.players.splice(idx, 1);
+            await saveWeek(env, week);
+            await refreshRoster(env, chatConf.chatId, week);
+            msg = `You're out, ${name}.`;
+          } else if (action === 'in') {
+            msg = `${name}, you're already on the list.`;
+          } else {
+            msg = `${name} wasn't found on the list.`;
+          }
+        }
+        return Response.redirect(`${url.origin}/signup?done=${encodeURIComponent(msg)}`, 303);
+      }
+
+      return new Response(signupPageHtml(week, url.searchParams.get('done') || ''), {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
     }
 
     return new Response('🏓 Pickleball bot is running.', { status: 200 });
