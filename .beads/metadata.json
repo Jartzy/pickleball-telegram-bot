@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pickleball_telegram_bot",
+  "project_id": "f41415ca-8d4b-43b7-b2a2-6479743e09cd"
+}
