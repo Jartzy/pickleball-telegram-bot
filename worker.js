@@ -247,20 +247,20 @@ function joinOutcome(week) {
 }
 
 function joinLabel(week) {
-  if (isFull(week)) return `🚫 All ${CONFIG.game.courts} courts full`;
+  if (isFull(week)) return `🚫 Courts full`;
   const { court, needAfter, fills } = joinOutcome(week);
   if (fills) return `✅ I'm in — fills Court ${court}!`;
-  return `✅ I'm in (Court ${court} · ${needAfter} more needed)`;
+  return `✅ I'm in — Court ${court}, ${needAfter} more`;
 }
 
 function rosterKeyboard(week) {
   return {
     inline_keyboard: [
+      [{ text: week ? joinLabel(week) : "✅ I'm in", callback_data: 'in' }],
       [
-        { text: week ? joinLabel(week) : "✅ I'm in", callback_data: 'in' },
-        { text: "❌ I can't make it", callback_data: 'out' },
+        { text: "❌ Can't make it", callback_data: 'out' },
+        { text: '➕ Bring a guest', callback_data: 'guest' },
       ],
-      [{ text: '➕ Bring a guest', callback_data: 'guest' }],
     ],
   };
 }
@@ -771,16 +771,19 @@ async function handleChatMember(env, upd) {
   );
 }
 
-/** Posts a real (notifying) message about a roster change made off-Telegram. */
+/**
+ * Announce what changed, then re-post the roster underneath it. The roster
+ * carries the buttons, so it stays the last (and actionable) message.
+ */
+async function postChange(env, chatId, week, line) {
+  if (line) {
+    await tg(env, 'sendMessage', { chat_id: chatId, text: line, parse_mode: 'HTML' });
+  }
+  await refreshRoster(env, chatId, week, { repost: true });
+}
+
 async function announceWeb(env, chatId, week, line) {
-  await tg(env, 'sendMessage', {
-    chat_id: chatId,
-    text: `${line}\n${headcountLine(week)}`,
-    parse_mode: 'HTML',
-    // Carry the actions so people can respond right here rather than hunting
-    // for the pinned roster.
-    reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(week),
-  });
+  await postChange(env, chatId, week, `${line}\n${headcountLine(week)}`);
 }
 
 /** Hard ceiling on sign-ups: every court at the venue, full. */
@@ -967,14 +970,14 @@ async function handleCallback(env, cb) {
     // One tap holds the spot under a placeholder name — no typing, no command.
     const sponsor = fullName(from);
     const label = nextGuestLabel(week, sponsor);
-    week.players.push({ key: `g:${from.id}:${label.toLowerCase()}`, name: label, guestOf: from.id, guestOfName: sponsor });
+    const newGuest = { key: `g:${from.id}:${label.toLowerCase()}`, name: label, guestOf: from.id, guestOfName: sponsor };
+    week.players.push(newGuest);
     await saveWeek(env, week);
-    await refreshRoster(env, chatConf.chatId, week);
 
     // One-use link bound to THIS placeholder: tapping it joins the group and
     // claims this exact spot.
-    const player = week.players[week.players.length - 1];
-    const link = await mintGuestInvite(env, chatConf.chatId, week, player);
+    const link = await mintGuestInvite(env, chatConf.chatId, week, newGuest);
+    await saveWeek(env, week); // persist the stored claim link
 
     const personal = link
       ? `➕ You're holding a spot for <b>${esc(label)}</b>.\n\n<b>Invite them:</b> send this link — it's unique to them and works once.\n${link}\n\nTapping it adds them to the group and turns the placeholder into their name, so they can confirm or cancel for themselves.\n\nHandy to paste alongside it:\n<i>Pickleball ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}. Roster + sign-up: ${CONFIG.webUrl}</i>`
@@ -1015,21 +1018,28 @@ async function handleCallback(env, cb) {
   }
 
   if (cb.data === 'in') {
+    if (week.players.some((p) => p.key === `u:${from.id}`)) {
+      const spot = week.players.findIndex((p) => p.key === `u:${from.id}`) + 1;
+      const c = Math.floor((spot - 1) / CONFIG.playersPerCourt) + 1;
+      return answer(`You're already in — #${spot}, Court ${c}. Tap "Can't make it" to drop out.`, true);
+    }
     if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
-    if (!addMember(week, from)) return answer("You're already on the roster!");
+    addMember(week, from);
     await saveWeek(env, week);
-    await refreshRoster(env, chatConf.chatId, week);
     const pos = week.players.length;
     const court = Math.floor((pos - 1) / CONFIG.playersPerCourt) + 1;
+    await postChange(env, chatConf.chatId, week, `✅ <b>${esc(fullName(from))}</b> is in.\n${headcountLine(week)}`);
     return answer(`You're in — #${pos}, Court ${court}.`);
   }
 
   if (cb.data === 'out') {
     const before = [...week.players];
     const removed = removeMember(week, from.id);
-    if (removed.length === 0) return answer("You weren't on the roster.");
+    if (removed.length === 0) {
+      return answer("You're not on the roster this week, so there's nothing to drop.", true);
+    }
     await saveWeek(env, week);
-    await refreshRoster(env, chatConf.chatId, week);
+    await postChange(env, chatConf.chatId, week, `❌ <b>${esc(fullName(from))}</b> can no longer make it.\n${headcountLine(week)}`);
     // Announce when a full court just broke, or any time after roll call.
     if (brokeAConfirmedCourt(before, week.players) || week.phase === 'rollcall' || week.phase === 'urgent') {
       await tg(env, 'sendMessage', {
@@ -1526,15 +1536,7 @@ export default {
           }
           if (['in', 'out', 'guest', 'dropguest', 'rename'].includes(action)) {
             await saveWeek(env, week);
-            await refreshRoster(env, chatConf.chatId, week);
-            if (announce) {
-              await tg(env, 'sendMessage', {
-                chat_id: chatConf.chatId,
-                text: `${announce}\n${headcountLine(week)}`,
-                parse_mode: 'HTML',
-                reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(week),
-              });
-            }
+            await postChange(env, chatConf.chatId, week, announce ? `${announce}\n${headcountLine(week)}` : null);
           }
           return new Response(signupPageHtml(week, note, viewer), {
             headers: { 'content-type': 'text/html; charset=utf-8' },
