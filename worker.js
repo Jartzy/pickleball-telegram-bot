@@ -1087,7 +1087,7 @@ export default {
 
     if (url.pathname === '/webhook' && request.method === 'POST') {
       // Telegram echoes back the secret we registered with setWebhook.
-      if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET || request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const update = await request.json();
@@ -1105,7 +1105,7 @@ export default {
     // chat_member updates are NOT delivered unless explicitly requested, and
     // minting invite links needs admin rights. GET /setup-webhook?key=SECRET
     if (url.pathname === '/setup-webhook') {
-      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const hook = await tg(env, 'setWebhook', {
@@ -1144,7 +1144,7 @@ export default {
     // --- Testing: manually fire a scheduled slot ---
     // GET /run?slot=rollcall&key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/run') {
-      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const slot = url.searchParams.get('slot');
@@ -1159,7 +1159,7 @@ export default {
     // --- Testing: wipe the current week's roster ---
     // GET /reset?key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/reset') {
-      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const date = activeGameDate(new Date());
