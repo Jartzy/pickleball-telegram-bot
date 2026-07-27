@@ -205,6 +205,11 @@ async function saveWeek(env, week) {
 // ============================================================================
 
 async function tg(env, method, params) {
+  // Link previews blow up the message with a huge card (e.g. the Google Maps
+  // pin). Off by default everywhere; pass link_preview_options to override.
+  if (method === 'sendMessage' || method === 'editMessageText') {
+    params = { link_preview_options: { is_disabled: true }, ...params };
+  }
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -215,14 +220,19 @@ async function tg(env, method, params) {
   return data;
 }
 
+// Marker on the bot's guest prompt. Telegram delivers reply_to_message.text as
+// plain text, so we match the unformatted form (see handleCommand).
+const GUEST_PROMPT_PLAIN = '➕ Adding a guest';
+const GUEST_PROMPT = '➕ <b>Adding a guest</b>';
+
 function rosterKeyboard() {
   return {
     inline_keyboard: [
       [
         { text: "✅ I'm in", callback_data: 'in' },
-        { text: "❌ I'm out", callback_data: 'out' },
+        { text: "❌ I can't make it", callback_data: 'out' },
       ],
-      [{ text: '➕ Bring a guest (how?)', callback_data: 'guesthelp' }],
+      [{ text: '➕ Bring a guest', callback_data: 'guest' }],
     ],
   };
 }
@@ -261,7 +271,7 @@ function rosterText(week) {
     lines.push('');
   }
 
-  lines.push(`👥 ${week.players.length} in · tap a button below, or /guest Name to add a guest`);
+  lines.push(`👥 ${week.players.length} in`);
   return lines.join('\n');
 }
 
@@ -375,6 +385,20 @@ function addMember(week, from) {
   return true;
 }
 
+/** How many courts are currently full (4/4). */
+function confirmedCourtCount(players) {
+  return groupPlayersIntoCourts(players).filter((c) => c.isConfirmed).length;
+}
+
+/**
+ * True when a drop knocked a previously-full court back to incomplete — the
+ * moment the group actually needs to hear about it ("we need 1 more"),
+ * regardless of which phase the week is in.
+ */
+function brokeAConfirmedCourt(beforePlayers, afterPlayers) {
+  return confirmedCourtCount(afterPlayers) < confirmedCourtCount(beforePlayers);
+}
+
 /** Removes a member and any guests they sponsored. Returns removed entries. */
 function removeMember(week, userId) {
   const removed = week.players.filter((p) => p.key === `u:${userId}` || p.guestOf === userId);
@@ -399,7 +423,7 @@ function describeCascade(beforePlayers, week, removedNames) {
     }
   });
 
-  const lines = [`⚠️ <b>${esc(removedNames.join(', '))}</b> dropped out.`];
+  const lines = [`⚠️ <b>${esc(removedNames.join(', '))}</b> can no longer make it.`];
   for (const move of promoted) lines.push(`⬆️ ${esc(move)}`);
 
   const courts = groupPlayersIntoCourts(week.players);
@@ -453,8 +477,16 @@ async function handleCallback(env, cb) {
   const week = await getWeek(env, activeGameDate(new Date()));
   const from = cb.from;
 
-  if (cb.data === 'guesthelp') {
-    return answer('Type "/guest FirstName" in the chat to add a guest — they don\'t need Telegram.');
+  if (cb.data === 'guest') {
+    // force_reply + selective aims the reply box at just this user, so adding
+    // a guest is a tap-and-type instead of remembering a command.
+    await tg(env, 'sendMessage', {
+      chat_id: chatConf.chatId,
+      text: `${GUEST_PROMPT}\n${mention({ id: from.id, name: fullName(from) })} — reply to this message with their first name. They don't need Telegram. Remove them later with <code>/unguest Name</code>.`,
+      parse_mode: 'HTML',
+      reply_markup: { force_reply: true, selective: true },
+    });
+    return answer('Reply with your guest\'s first name.');
   }
 
   if (week.phase === 'final') {
@@ -491,8 +523,8 @@ async function handleCallback(env, cb) {
     if (removed.length === 0) return answer("You weren't on the roster.");
     await saveWeek(env, week);
     await refreshRoster(env, chatConf.chatId, week);
-    // After the roll call, drops are urgent: announce the cascade + recruit.
-    if (week.phase === 'rollcall' || week.phase === 'urgent') {
+    // Announce when a full court just broke, or any time after roll call.
+    if (brokeAConfirmedCourt(before, week.players) || week.phase === 'rollcall' || week.phase === 'urgent') {
       await tg(env, 'sendMessage', {
         chat_id: chatConf.chatId,
         text: describeCascade(before, week, removed.map((r) => r.name)),
@@ -513,6 +545,28 @@ async function handleCommand(env, msg) {
   const chatId = msg.chat.id;
   const from = msg.from;
   const say = (t, extra = {}) => tg(env, 'sendMessage', { chat_id: chatId, text: t, parse_mode: 'HTML', ...extra });
+
+  // Guest flow: a plain reply to the bot's "Adding a guest" prompt carries the
+  // guest's name, so nobody has to remember the /guest command.
+  const repliedTo = msg.reply_to_message;
+  if (
+    !text.startsWith('/') &&
+    repliedTo &&
+    repliedTo.from &&
+    repliedTo.from.is_bot &&
+    (repliedTo.text || '').startsWith(GUEST_PROMPT_PLAIN)
+  ) {
+    const conf = await kvGet(env, 'chat');
+    if (!conf || conf.chatId !== chatId) return;
+    const name = text.slice(0, 40).trim();
+    if (!name) return say('No name given — tap ➕ Bring a guest to try again.');
+    const week = await getWeek(env, activeGameDate(new Date()));
+    const key = `g:${from.id}:${name.toLowerCase()}`;
+    if (findPlayer(week, key) !== -1) return say(`${esc(name)} is already on the roster.`);
+    week.players.push({ key, name, guestOf: from.id, guestOfName: fullName(from) });
+    await saveWeek(env, week);
+    return refreshRoster(env, chatId, week);
+  }
 
   if (cmd === '/setup') {
     // Only group admins may bind the bot to a group.
@@ -552,7 +606,7 @@ async function handleCommand(env, msg) {
     if (removed.length > 0) {
       await saveWeek(env, week);
       await refreshRoster(env, chatId, week);
-      if (week.phase !== 'open') {
+      if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players)) {
         await say(describeCascade(before, week, removed.map((r) => r.name)));
         await sendRecruitingAlert(env, chatId, week, null);
       }
@@ -579,7 +633,7 @@ async function handleCommand(env, msg) {
     week.players.splice(idx, 1);
     await saveWeek(env, week);
     await refreshRoster(env, chatId, week);
-    if (week.phase !== 'open') {
+    if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players)) {
       await say(describeCascade(before, week, [name]));
       await sendRecruitingAlert(env, chatId, week, null);
     }
