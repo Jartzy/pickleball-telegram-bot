@@ -261,10 +261,6 @@ function rosterKeyboard(week) {
         { text: "❌ I can't make it", callback_data: 'out' },
       ],
       [{ text: '➕ Bring a guest', callback_data: 'guest' }],
-      [
-        { text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl },
-        { text: '🔔 Personal updates', url: dmOptInUrl() },
-      ],
     ],
   };
 }
@@ -365,7 +361,6 @@ function signupPageHtml(week, done, viewer = null) {
       // Telegram members are locked in (can't be dropped from the web) — badge
       // them so web visitors see the perk of joining. Guests already read as
       // "(guest of X)" via displayName.
-      const tag = p.key.startsWith('u:') ? ' <span class="tag">Telegram</span>' : '';
       // Only a verified Mini App viewer can be identified — this is the "(me)"
       // a shared Telegram group message can never show.
       const me = viewer && p.key === `u:${viewer.id}` ? ' <span class="me">(me)</span>' : '';
@@ -374,7 +369,7 @@ function signupPageHtml(week, done, viewer = null) {
       const drop = mine
         ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove">✕</button></form>`
         : '';
-      b += `<li>${displayName(p)}${tag}${me}${drop}</li>`;
+      b += `<li>${displayName(p)}${me}${drop}</li>`;
     }
     b += '</ol>';
     if (!c.isConfirmed) {
@@ -387,12 +382,13 @@ function signupPageHtml(week, done, viewer = null) {
   }
   b += `<p>👥 ${week.players.length} signed up</p>`;
   // After adding a guest, surface the message to forward to them.
-  if (done.startsWith('Added ') && CONFIG.telegramInviteUrl) {
+  if (done.startsWith('Added ') && (viewer?.inviteLink || CONFIG.telegramInviteUrl)) {
     b += `<div class="share">
       <h2>📨 Invite them</h2>
-      <p>Send your guest this so they can confirm and get updates:</p>
-      <p class="snippet">Pickleball ${esc(fmtGameDate(week.date))} at ${esc(CONFIG.game.label)}, ${esc(CONFIG.game.location)}. Join the group: ${CONFIG.telegramInviteUrl}</p>
-      <p><a href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">Open the group invite ↗</a></p>
+      <p>Send your guest this link — it's unique to them, works once, and adds them to the group in their own name:</p>
+      <p class="snippet">${esc(viewer && viewer.inviteLink ? viewer.inviteLink : CONFIG.telegramInviteUrl)}</p>
+      <p>Paste this with it:</p>
+      <p class="snippet">Pickleball ${esc(fmtGameDate(week.date))} at ${esc(CONFIG.game.label)}, ${esc(CONFIG.game.location)}. Roster: ${CONFIG.webUrl}</p>
     </div>`;
   }
   if (viewer) {
@@ -575,15 +571,55 @@ function headcountLine(week) {
 // record each opted-in user's private chat id and fall back to a group mention.
 // ---------------------------------------------------------------------------
 
+// Notification categories a person can switch off individually.
+const DM_PREFS = [
+  { key: 'promo', label: 'Spot opened / you moved up' },
+  { key: 'guest', label: 'Your guest activity + invite links' },
+  { key: 'reminders', label: 'Roll call and last call' },
+];
+
+async function getDmRecord(env, userId) {
+  return await kvGet(env, `dm:${userId}`);
+}
+
+function prefEnabled(rec, category) {
+  if (!rec) return false;
+  if (rec.muted) return false;
+  if (!category) return true;
+  return rec.prefs ? rec.prefs[category] !== false : true;
+}
+
+function notificationsCard(rec) {
+  const rows = DM_PREFS.map((p) => [
+    {
+      text: `${prefEnabled(rec, p.key) ? '✅' : '❌'} ${p.label}`,
+      callback_data: `pref:${p.key}`,
+    },
+  ]);
+  rows.push([
+    { text: rec && rec.muted ? '🔔 Turn all messages back on' : '🔕 Mute everything', callback_data: 'pref:mute' },
+  ]);
+  return {
+    text:
+      '🔔 <b>Your notifications</b>\n' +
+      (rec && rec.muted
+        ? 'Everything is muted — you\'ll only see updates in the group.'
+        : 'Tap any line to switch it off or back on.'),
+    reply_markup: { inline_keyboard: rows },
+  };
+}
+
 async function getDmChat(env, userId) {
   const v = await kvGet(env, `dm:${userId}`);
   return v ? v.chatId : null;
 }
 
 /** DMs an opted-in user. Returns true when actually delivered. */
-async function dmUser(env, userId, text, extra = {}) {
-  const chatId = await getDmChat(env, userId);
-  if (!chatId) return false;
+async function dmUser(env, userId, text, extra = {}, category = null) {
+  const rec = await getDmRecord(env, userId);
+  if (!rec || !rec.chatId) return false;
+  if (!prefEnabled(rec, category)) return false; // opted out of this kind
+  const chatId = rec.chatId;
   const res = await tg(env, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
   return !!res.ok;
 }
@@ -599,7 +635,7 @@ function dmOptInUrl(payload = 'dm') {
  * group whenever we're able to.
  */
 async function notifyPlayer(env, groupChatId, user, text, extra = {}) {
-  if (await dmUser(env, user.id, text, extra)) return 'dm';
+  if (await dmUser(env, user.id, text, extra, user.category || null)) return 'dm';
   await tg(env, 'sendMessage', {
     chat_id: groupChatId,
     text: `${mention(user)} — ${text}`,
@@ -790,7 +826,7 @@ async function notifyPromotions(env, groupChatId, week, promotions) {
     await notifyPlayer(
       env,
       groupChatId,
-      { id: targetId, name: player.guestOfName || player.name },
+      { id: targetId, name: player.guestOfName || player.name, category: 'promo' },
       `${headline}\n${fmtGameDate(week.date)}, ${CONFIG.game.label} · ${CONFIG.game.location}${tail}`,
       { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
     );
@@ -857,6 +893,36 @@ async function handleCallback(env, cb) {
   const week = await getWeek(env, activeGameDate(new Date()));
   const from = cb.from;
 
+  if (cb.data.startsWith('pref:')) {
+    const which = cb.data.slice(5);
+    const rec = (await getDmRecord(env, from.id)) || { chatId: cb.message && cb.message.chat.id };
+    if (which === 'show') {
+      const card = notificationsCard(rec);
+      await tg(env, 'sendMessage', {
+        chat_id: cb.message.chat.id,
+        text: card.text,
+        parse_mode: 'HTML',
+        reply_markup: card.reply_markup,
+      });
+      return answer('');
+    }
+    if (which === 'mute') rec.muted = !rec.muted;
+    else {
+      rec.prefs = rec.prefs || {};
+      rec.prefs[which] = rec.prefs[which] === false;
+    }
+    await kvPut(env, `dm:${from.id}`, rec);
+    const card = notificationsCard(rec);
+    await tg(env, 'editMessageText', {
+      chat_id: cb.message.chat.id,
+      message_id: cb.message.message_id,
+      text: card.text,
+      parse_mode: 'HTML',
+      reply_markup: card.reply_markup,
+    });
+    return answer('Updated.');
+  }
+
   if (cb.data === 'guest') {
     if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
     // One tap holds the spot under a placeholder name — no typing, no command.
@@ -876,7 +942,7 @@ async function handleCallback(env, cb) {
       : `➕ You added <b>${esc(label)}</b>. (Couldn't create an invite link — check I'm an admin with "Invite Users via Link".)`;
 
     // Instructions are for the sponsor only; the group just needs the count.
-    const sentPrivately = await dmUser(env, from.id, personal);
+    const sentPrivately = await dmUser(env, from.id, personal, {}, 'guest');
     await tg(env, 'sendMessage', {
       chat_id: chatConf.chatId,
       text: sentPrivately
@@ -952,7 +1018,13 @@ async function handleCommand(env, msg) {
   // ANY private message proves we can reach this person, so record the chat.
   // (People who pressed Start before this existed were never captured.)
   if (msg.chat.type === 'private') {
-    await kvPut(env, `dm:${from.id}`, { chatId, name: fullName(from) });
+    const existing = (await getDmRecord(env, from.id)) || {};
+    await kvPut(env, `dm:${from.id}`, { ...existing, chatId, name: fullName(from) });
+  }
+
+  if ((cmd === '/notifications' || cmd === '/settings') && msg.chat.type === 'private') {
+    const card = notificationsCard(await getDmRecord(env, from.id));
+    return say(card.text, { reply_markup: card.reply_markup });
   }
 
   // Sandbox: point the bot at this DM so testing doesn't spam the group.
@@ -984,9 +1056,9 @@ async function handleCommand(env, msg) {
     if (CONFIG.telegramInviteUrl) {
       buttons.push([{ text: '👥 Join the group', url: CONFIG.telegramInviteUrl }]);
     }
-    buttons.push([{ text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl }]);
+    buttons.push([{ text: '🔔 Manage notifications', callback_data: 'pref:show' }]);
     return say(
-      `🔔 <b>You're set up for personal updates.</b>\nI'll message you here when a spot opens for you, when you're promoted onto a court, or when your guest claims their spot — instead of filling up the group chat.`,
+      `🔔 <b>You're set up for personal updates.</b>\nI'll message you here when a spot opens for you, when you're promoted onto a court, or when your guest claims their spot — instead of filling up the group chat.\n\nSend /notifications any time to choose what I message you about.`,
       { reply_markup: { inline_keyboard: buttons } }
     );
   }
@@ -1345,12 +1417,15 @@ export default {
             note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
           } else if (action === 'guest') {
             const label = nextGuestLabel(week, who);
-            week.players.push({
+            const guest = {
               key: `g:${tgUser.id}:${label.toLowerCase()}`,
               name: label,
               guestOf: tgUser.id,
               guestOfName: who,
-            });
+            };
+            week.players.push(guest);
+            // Same one-use claim link the Telegram button mints.
+            viewer.inviteLink = await mintGuestInvite(env, groupId, week, guest);
             note = `Added ${label}.`;
             announce = `➕ <b>${esc(who)}</b> added <b>${esc(label)}</b>.`;
           } else if (action === 'dropguest') {
