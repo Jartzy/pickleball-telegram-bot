@@ -1,12 +1,12 @@
 {
   "name": "pickleball-telegram-bot",
   "version": "1.0.0",
-  "description": "Serverless weekly pickleball reservation system with waitlist — Telegram bot on Cloudflare Workers (free tier).",
+  "description": "Serverless weekly pickleball reservation system with waitlist \u2014 Telegram bot on Cloudflare Workers (free tier).",
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "node test.js"
+    "test": "node test-roster.mjs"
   },
   "license": "MIT",
   "devDependencies": {

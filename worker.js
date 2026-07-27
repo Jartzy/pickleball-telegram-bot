@@ -45,6 +45,7 @@ const CONFIG = {
     hour: 6,
     label: '6:00 AM',
     location: 'Bob Baskin Park',
+    courts: 4, // courts available at the venue -> hard cap on sign-ups
     mapUrl: 'https://www.google.com/maps/search/?api=1&query=Bob+Baskin+Park',
   },
 
@@ -246,6 +247,7 @@ function joinOutcome(week) {
 }
 
 function joinLabel(week) {
+  if (isFull(week)) return `🚫 All ${CONFIG.game.courts} courts full`;
   const { court, needAfter, fills } = joinOutcome(week);
   if (fills) return `✅ I'm in — fills Court ${court}!`;
   return `✅ I'm in (Court ${court} · ${needAfter} more needed)`;
@@ -276,7 +278,7 @@ function rosterText(week) {
   const lines = [];
 
   lines.push(`🏓 <b>Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</b>`);
-  lines.push(`📍 <a href="${CONFIG.game.mapUrl}">${CONFIG.game.location}</a>`);
+  lines.push(`📍 <a href="${CONFIG.game.mapUrl}">${CONFIG.game.location}</a> · ${CONFIG.game.courts} courts`);
   if (week.phase === 'final') lines.push('🔒 <b>FINAL ROSTER</b>');
   lines.push('');
 
@@ -352,7 +354,7 @@ function signupPageHtml(week, done, viewer = null) {
   let b = '';
   if (done) b += `<p class="msg">${esc(done)}</p>`;
   b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</h1>`;
-  b += `<p class="loc">📍 <a href="${CONFIG.game.mapUrl}" target="_blank" rel="noopener">${esc(CONFIG.game.location)}</a></p>`;
+  b += `<p class="loc">📍 <a href="${CONFIG.game.mapUrl}" target="_blank" rel="noopener">${esc(CONFIG.game.location)}</a> · ${CONFIG.game.courts} courts</p>`;
   if (courts.length === 0) b += `<p><i>Nobody signed up yet — be the first!</i></p>`;
   for (const c of courts) {
     b += c.isConfirmed
@@ -696,6 +698,15 @@ async function announceWeb(env, chatId, week, line) {
   });
 }
 
+/** Hard ceiling on sign-ups: every court at the venue, full. */
+function maxPlayers() {
+  return CONFIG.game.courts * CONFIG.playersPerCourt;
+}
+
+function isFull(week) {
+  return week.players.length >= maxPlayers();
+}
+
 /** How many courts are currently full (4/4). */
 function confirmedCourtCount(players) {
   return groupPlayersIntoCourts(players).filter((c) => c.isConfirmed).length;
@@ -828,7 +839,8 @@ async function sendRecruitingAlert(env, chatId, week, intro) {
 
 async function handleCallback(env, cb) {
   const chatConf = await kvGet(env, 'chat');
-  const answer = (text) => tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: false });
+  const answer = (text, alert = false) =>
+    tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert });
 
   if (!chatConf) return answer('Bot not set up yet — an admin must run /setup in the group.');
 
@@ -836,6 +848,7 @@ async function handleCallback(env, cb) {
   const from = cb.from;
 
   if (cb.data === 'guest') {
+    if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
     // One tap holds the spot under a placeholder name — no typing, no command.
     const sponsor = fullName(from);
     const label = nextGuestLabel(week, sponsor);
@@ -849,7 +862,7 @@ async function handleCallback(env, cb) {
     const link = await mintGuestInvite(env, chatConf.chatId, week, player);
 
     const personal = link
-      ? `➕ You added <b>${esc(label)}</b>.\n\nSend them this link — it's unique to this guest and works once:\n${link}\n\nWhen they tap it they'll join the group and take over this spot automatically.`
+      ? `➕ You're holding a spot for <b>${esc(label)}</b>.\n\n<b>Invite them:</b> send this link — it's unique to them and works once.\n${link}\n\nTapping it adds them to the group and turns the placeholder into their name, so they can confirm or cancel for themselves.\n\nHandy to paste alongside it:\n<i>Pickleball ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}. Roster + sign-up: ${CONFIG.webUrl}</i>`
       : `➕ You added <b>${esc(label)}</b>. (Couldn't create an invite link — check I'm an admin with "Invite Users via Link".)`;
 
     // Instructions are for the sponsor only; the group just needs the count.
@@ -887,6 +900,7 @@ async function handleCallback(env, cb) {
   }
 
   if (cb.data === 'in') {
+    if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
     if (!addMember(week, from)) return answer("You're already on the roster!");
     await saveWeek(env, week);
     await refreshRoster(env, chatConf.chatId, week);
@@ -1017,6 +1031,7 @@ async function handleCommand(env, msg) {
   if (cmd === '/guest') {
     const name = args.join(' ').trim();
     if (!name) return say('Usage: /guest FirstName — adds a guest under your name.');
+    if (isFull(week)) return say(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`);
     const key = `g:${from.id}:${name.toLowerCase()}`;
     if (findPlayer(week, key) !== -1) return say(`${esc(name)} is already on the roster.`);
     week.players.push({ key, name, guestOf: from.id, guestOfName: fullName(from) });
@@ -1287,7 +1302,11 @@ export default {
           let note = '';
           let announce = '';
           const who = fullName(from);
-          if (action === 'guest') {
+          if (action === 'guest' && isFull(week)) {
+            note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+          } else if (action === 'in' && isFull(week)) {
+            note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+          } else if (action === 'guest') {
             const label = nextGuestLabel(week, who);
             week.players.push({
               key: `g:${tgUser.id}:${label.toLowerCase()}`,
@@ -1351,7 +1370,9 @@ export default {
         if (name) {
           const key = `w:${name.toLowerCase()}`;
           const idx = week.players.findIndex((p) => p.key === key);
-          if (action === 'guest') {
+          if ((action === 'guest' || action === 'in') && isFull(week) && idx === -1) {
+            msg = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+          } else if (action === 'guest') {
             const label = nextGuestLabel(week, name);
             week.players.push({
               key: `wg:${name.toLowerCase()}:${label.toLowerCase()}`,
