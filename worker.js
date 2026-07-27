@@ -1660,7 +1660,9 @@ export default {
       return new Response(ics, {
         headers: {
           'content-type': 'text/calendar; charset=utf-8',
-          'content-disposition': `attachment; filename="pickleball-${date}.ics"`,
+          // inline lets iOS/macOS hand the file straight to Calendar; with
+          // "attachment" the browser is told to save it instead.
+          'content-disposition': `inline; filename="pickleball-${date}.ics"`,
         },
       });
     }
