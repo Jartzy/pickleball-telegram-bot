@@ -340,7 +340,12 @@ function signupPageHtml(week, done, viewer = null) {
       // Only a verified Mini App viewer can be identified — this is the "(me)"
       // a shared Telegram group message can never show.
       const me = viewer && p.key === `u:${viewer.id}` ? ' <span class="me">(me)</span>' : '';
-      b += `<li>${displayName(p)}${tag}${me}</li>`;
+      // A sponsor can drop each of their own guests individually.
+      const mine = viewer && p.guestOf === viewer.id;
+      const drop = mine
+        ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove this guest">✕</button></form>`
+        : '';
+      b += `<li>${displayName(p)}${tag}${me}${drop}</li>`;
     }
     b += '</ol>';
     if (!c.isConfirmed) {
@@ -349,6 +354,15 @@ function signupPageHtml(week, done, viewer = null) {
     }
   }
   b += `<p>👥 ${week.players.length} signed up</p>`;
+  // After adding a guest, surface the message to forward to them.
+  if (done.startsWith('Added ') && CONFIG.telegramInviteUrl) {
+    b += `<div class="share">
+      <h2>📨 Invite them</h2>
+      <p>Send your guest this so they can confirm and get updates:</p>
+      <p class="snippet">Pickleball ${esc(fmtGameDate(week.date))} at ${esc(CONFIG.game.label)}, ${esc(CONFIG.game.location)}. Join the group: ${CONFIG.telegramInviteUrl}</p>
+      <p><a href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">Open the group invite ↗</a></p>
+    </div>`;
+  }
   if (viewer) {
     // Identity is proven by initData, so no name box — and the action is
     // contextual to whether this person is already on the roster.
@@ -410,6 +424,12 @@ function signupPageHtml(week, done, viewer = null) {
   .me{font-size:.8rem;color:#16a34a;font-weight:600}
   .wide{width:100%}
   .guest{background:#334155;margin-top:10px}
+  .x{display:inline;margin-left:6px}
+  .xbtn{background:#e2e8f0;color:#b91c1c;border:0;border-radius:6px;padding:1px 7px;font-size:.8rem;cursor:pointer;width:auto;flex:none}
+  .share{margin-top:20px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
+  .share h2{font-size:1rem;margin:0 0 6px}
+  .share p{margin:0 0 8px;font-size:.9rem}
+  .snippet{background:#fff;border:1px dashed #d6d3d1;border-radius:8px;padding:10px;font-size:.85rem;word-break:break-word}
   </style></head><body${viewer ? ' data-tg="1"' : ''}>${b}
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script>
@@ -490,6 +510,30 @@ function nextGuestLabel(week, sponsorName) {
     if (!taken(`${base} ${i}`)) return `${base} ${i}`;
   }
   return `${base} 21`;
+}
+
+/**
+ * One-line status for announcements. Editing the pinned roster is silent, so
+ * anything that changes the roster from the web posts a real message carrying
+ * this — otherwise the group never learns the headcount moved.
+ */
+function headcountLine(week) {
+  const courts = groupPlayersIntoCourts(week.players);
+  const confirmed = courts.filter((c) => c.isConfirmed).length;
+  const partial = courts.find((c) => !c.isConfirmed);
+  let s = `👥 ${week.players.length} in`;
+  if (confirmed) s += ` · ${confirmed} court${confirmed === 1 ? '' : 's'} confirmed`;
+  if (partial) s += ` · Court ${partial.courtNumber} needs ${partial.playersNeeded} more`;
+  return s;
+}
+
+/** Posts a real (notifying) message about a roster change made off-Telegram. */
+async function announceWeb(env, chatId, week, line) {
+  await tg(env, 'sendMessage', {
+    chat_id: chatId,
+    text: `${line}\n${headcountLine(week)}`,
+    parse_mode: 'HTML',
+  });
 }
 
 /** How many courts are currently full (4/4). */
@@ -597,7 +641,7 @@ async function handleCallback(env, cb) {
       : '';
     await tg(env, 'sendMessage', {
       chat_id: chatConf.chatId,
-      text: `➕ ${mention({ id: from.id, name: sponsor })} — I've added <b>${esc(label)}</b>.${invite}`,
+      text: `➕ ${mention({ id: from.id, name: sponsor })} — I've added <b>${esc(label)}</b>.\n${headcountLine(week)}${invite}`,
       parse_mode: 'HTML',
     });
     return answer(`Added ${label}.`);
@@ -918,22 +962,41 @@ export default {
             username: tgUser.username,
           };
           let note = '';
+          let announce = '';
+          const who = fullName(from);
           if (action === 'guest') {
-            const sponsor = fullName(from);
-            const label = nextGuestLabel(week, sponsor);
+            const label = nextGuestLabel(week, who);
             week.players.push({
               key: `g:${tgUser.id}:${label.toLowerCase()}`,
               name: label,
               guestOf: tgUser.id,
-              guestOfName: sponsor,
+              guestOfName: who,
             });
             note = `Added ${label}.`;
+            announce = `➕ <b>${esc(who)}</b> added <b>${esc(label)}</b>.`;
+          } else if (action === 'dropguest') {
+            // Only the sponsor may remove their own guest.
+            const gk = (form.get('guestKey') || '').toString();
+            const gi = week.players.findIndex((p) => p.key === gk && p.guestOf === tgUser.id);
+            if (gi === -1) {
+              note = 'That guest is no longer on the list.';
+            } else {
+              const [gone] = week.players.splice(gi, 1);
+              note = `Removed ${gone.name}.`;
+              announce = `➖ <b>${esc(who)}</b> removed <b>${esc(gone.name)}</b>.`;
+            }
           } else if (action === 'in') {
-            note = addMember(week, from) ? "You're in!" : "You're already on the roster.";
+            const added = addMember(week, from);
+            note = added ? "You're in!" : "You're already on the roster.";
+            if (added) announce = `✅ <b>${esc(who)}</b> is in.`;
           } else if (action === 'out') {
             const before = [...week.players];
             const removed = removeMember(week, tgUser.id);
             note = removed.length ? "You're out — thanks for the heads-up." : "You weren't on the roster.";
+            // describeCascade already announces below when it fires.
+            if (removed.length && week.phase === 'open' && !brokeAConfirmedCourt(before, week.players)) {
+              announce = `❌ <b>${esc(who)}</b> can no longer make it.`;
+            }
             if (removed.length && (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players))) {
               await tg(env, 'sendMessage', {
                 chat_id: chatConf.chatId,
@@ -943,9 +1006,16 @@ export default {
               await sendRecruitingAlert(env, chatConf.chatId, week, null);
             }
           }
-          if (action === 'in' || action === 'out' || action === 'guest') {
+          if (['in', 'out', 'guest', 'dropguest'].includes(action)) {
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
+            if (announce) {
+              await tg(env, 'sendMessage', {
+                chat_id: chatConf.chatId,
+                text: `${announce}\n${headcountLine(week)}`,
+                parse_mode: 'HTML',
+              });
+            }
           }
           return new Response(signupPageHtml(week, note, viewer), {
             headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -966,17 +1036,20 @@ export default {
             });
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
+            await announceWeb(env, chatConf.chatId, week, `➕ <b>${esc(name)}</b> added <b>${esc(label)}</b>.`);
             msg = `Added ${label}.`;
           } else if (action === 'in' && idx === -1) {
             week.players.push({ key, name });
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
+            await announceWeb(env, chatConf.chatId, week, `✅ <b>${esc(name)}</b> is in (via the sign-up page).`);
             msg = `You're in, ${name}!`;
           } else if (action === 'out' && idx !== -1) {
             // Take their guests with them, mirroring the Telegram cascade.
             week.players = week.players.filter((p, i) => i !== idx && p.guestOf !== key);
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
+            await announceWeb(env, chatConf.chatId, week, `❌ <b>${esc(name)}</b> can no longer make it.`);
             msg = `You're out, ${name}.`;
           } else if (action === 'in') {
             msg = `${name}, you're already on the list.`;
