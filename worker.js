@@ -369,7 +369,11 @@ function signupPageHtml(week, done, viewer = null) {
       const drop = mine
         ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove">✕</button></form>`
         : '';
-      b += `<li>${displayName(p)}${me}${drop}</li>`;
+      const linkBit =
+        mine && p.inviteLink
+          ? ` <a class="ilink" href="${p.inviteLink}" target="_blank" rel="noopener" title="Their claim link">🔗</a>`
+          : '';
+      b += `<li>${displayName(p)}${me}${linkBit}${drop}</li>`;
     }
     b += '</ol>';
     if (!c.isConfirmed) {
@@ -379,6 +383,23 @@ function signupPageHtml(week, done, viewer = null) {
   }
   if (viewer && viewer.isAdmin) {
     b += `<p class="adminbar">🛠 <b>Admin controls</b> — only you can see these. The ✕ next to a name removes them (and any guests they brought).</p>`;
+  }
+  if (viewer) {
+    const mineList = week.players.filter(
+      (p) => p.guestOf === viewer.id || (viewer.isAdmin && p.key !== `u:${viewer.id}`)
+    );
+    if (mineList.length) {
+      b += `<form method="POST" action="/signup" class="rename">
+        <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
+        <label>Rename someone</label>
+        <select name="guestKey">${mineList
+          .map((p) => `<option value="${esc(p.key)}">${esc(p.name)}</option>`)
+          .join('')}</select>
+        <input name="newName" placeholder="Their real name" maxlength="40" required/>
+        <button name="action" value="rename" class="guest wide">✎ Save name</button>
+        <p class="fine">If they later claim their spot with the link, their own Telegram name takes over.</p>
+      </form>`;
+    }
   }
   b += `<p>👥 ${week.players.length} signed up</p>`;
   // After adding a guest, surface the message to forward to them.
@@ -452,6 +473,10 @@ function signupPageHtml(week, done, viewer = null) {
   .guest{background:#334155;margin-top:10px}
   .x{display:inline;margin-left:6px}
   .xbtn{background:#e2e8f0;color:#b91c1c;border:0;border-radius:6px;padding:1px 7px;font-size:.8rem;cursor:pointer;width:auto;flex:none}
+  .rename{margin:12px 0;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#fff}
+  .rename label{display:block;font-size:.8rem;font-weight:600;margin-bottom:6px}
+  .rename select,.rename input{width:100%;padding:9px;margin-bottom:8px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box;font-size:.9rem}
+  .ilink{text-decoration:none;font-size:.85rem;margin-left:4px}
   .adminbar{background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:8px 10px;font-size:.82rem;margin:10px 0}
   .share{margin-top:20px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
   .share h2{font-size:1rem;margin:0 0 6px}
@@ -675,6 +700,7 @@ async function mintGuestInvite(env, chatId, week, player) {
   if (!res.ok) return null;
   const link = res.result.invite_link;
   await kvPut(env, `invite:${link}`, { date: week.date, key: player.key });
+  player.inviteLink = link; // so it can be re-shown if the sponsor loses it
   return link;
 }
 
@@ -691,14 +717,27 @@ async function handleChatMember(env, upd) {
   const rec = await kvGet(env, `invite:${link}`);
   if (!rec) return;
 
+  await env.PICKLE_KV.delete(`invite:${link}`); // one claim only
+  const currentDate = activeGameDate(new Date());
+  const user = upd.new_chat_member.user;
+
+  // Link from a game that has already happened: they're in the group, but
+  // there's no spot to claim. Welcome them and point at the live roster.
+  if (rec.date !== currentDate) {
+    await dmUser(
+      env,
+      user.id,
+      `👋 Welcome! That invite was for ${fmtGameDate(rec.date)}, which has already been played.\nThe next game is <b>${fmtGameDate(currentDate)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)} — tap ✅ I'm in on the roster to grab a spot.`
+    );
+    return;
+  }
+
   const week = await getWeek(env, rec.date);
   const idx = week.players.findIndex((p) => p.key === rec.key);
-  await env.PICKLE_KV.delete(`invite:${link}`); // one claim only
   if (idx === -1) return; // placeholder already gone
 
   const chatConf = await kvGet(env, 'chat');
   if (!chatConf) return;
-  const user = upd.new_chat_member.user;
   const placeholder = week.players[idx];
   const sponsorId = placeholder.guestOf;
   const sponsorName = placeholder.guestOfName;
@@ -1127,8 +1166,7 @@ async function handleCommand(env, msg) {
     if (idx === -1) return say(`No one named "${esc(name)}" on the roster.`);
     const before = [...week.players];
     const [gone] = week.players.splice(idx, 1);
-    // Their guests go too, mirroring a normal drop.
-    week.players = week.players.filter((p) => p.guestOf !== gone.id && p.guestOf !== gone.key);
+    // Guests stay put — removing them is a separate, deliberate choice.
     await saveWeek(env, week);
     await refreshRoster(env, chatId, week);
     await say(describeCascade(before, week, [gone.name]));
@@ -1428,6 +1466,24 @@ export default {
             viewer.inviteLink = await mintGuestInvite(env, groupId, week, guest);
             note = `Added ${label}.`;
             announce = `➕ <b>${esc(who)}</b> added <b>${esc(label)}</b>.`;
+          } else if (action === 'rename') {
+            const gk = (form.get('guestKey') || '').toString();
+            const newName = (form.get('newName') || '').toString().trim().slice(0, 40);
+            const gi = week.players.findIndex(
+              (p) => p.key === gk && (p.guestOf === tgUser.id || (viewer.isAdmin && p.key !== `u:${tgUser.id}`))
+            );
+            if (gi === -1) {
+              note = 'That person is not yours to rename.';
+            } else if (!newName) {
+              note = 'Give them a name first.';
+            } else {
+              const old = week.players[gi].name;
+              // Key is untouched, so an unclaimed invite link still resolves —
+              // and a real claim will overwrite this name later.
+              week.players[gi].name = newName;
+              note = `Renamed ${old} to ${newName}.`;
+              announce = `✏️ <b>${esc(old)}</b> is now <b>${esc(newName)}</b>.`;
+            }
           } else if (action === 'dropguest') {
             // Only the sponsor may remove their own guest.
             const gk = (form.get('guestKey') || '').toString();
@@ -1439,9 +1495,10 @@ export default {
             } else {
               const beforeDrop = [...week.players];
               const [gone] = week.players.splice(gi, 1);
-              // Anyone they sponsored leaves with them.
-              week.players = week.players.filter((p) => p.guestOf !== gone.id && p.guestOf !== gone.key);
-              note = `Removed ${gone.name}.`;
+              // Guests deliberately stay: whoever is running the session
+              // decides whether they still have a game.
+              const orphans = week.players.filter((p) => p.guestOf === gone.id).length;
+              note = `Removed ${gone.name}.${orphans ? ` Their ${orphans} guest${orphans === 1 ? '' : 's'} stayed on the roster.` : ''}`;
               announce = `➖ <b>${esc(who)}</b> removed <b>${esc(gone.name)}</b>.`;
               await notifyPromotions(env, chatConf.chatId, week, computePromotions(beforeDrop, week));
             }
@@ -1467,7 +1524,7 @@ export default {
             }
             await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
           }
-          if (['in', 'out', 'guest', 'dropguest'].includes(action)) {
+          if (['in', 'out', 'guest', 'dropguest', 'rename'].includes(action)) {
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
             if (announce) {
