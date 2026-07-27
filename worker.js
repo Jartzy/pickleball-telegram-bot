@@ -66,6 +66,7 @@ const CONFIG = {
   // anyone who hasn't started it.
   botUsername: 'BicklePallBot',
   webhookUrl: 'https://pickleball-bot.jmartin84.workers.dev/webhook',
+  calendarUrl: 'https://pickleball-bot.jmartin84.workers.dev/event.ics',
 
   // Automation moments, in local (Pacific) time. Each fires once per game
   // week (idempotent), matched within a 15-minute cron window.
@@ -199,6 +200,12 @@ async function kvPut(env, key, value) {
   await env.PICKLE_KV.put(key, JSON.stringify(value));
 }
 
+/** Applies any admin overrides (venue, time, courts) over the compiled config. */
+async function applySettings(env) {
+  const o = await kvGet(env, 'settings');
+  if (o) Object.assign(CONFIG.game, o);
+}
+
 async function getWeek(env, date) {
   return (
     (await kvGet(env, `week:${date}`)) || {
@@ -249,8 +256,8 @@ function joinOutcome(week) {
 function joinLabel(week) {
   if (isFull(week)) return `🚫 Courts full`;
   const { needAfter, fills } = joinOutcome(week);
-  if (fills) return `✅ I'm in — completes a court!`;
-  return `✅ I'm in — ${needAfter} more needed`;
+  if (fills) return `✅ I'm in (that's a full court!)`;
+  return `✅ I'm in (${needAfter} more still needed)`;
 }
 
 function rosterKeyboard(week) {
@@ -925,9 +932,9 @@ async function askSponsorsToConfirmGuests(env, week) {
     await dmUser(
       env,
       sponsorId,
-      `🌙 <b>Roll call — pickleball tomorrow, ${CONFIG.game.label}</b>\n\nYou're bringing ${guests
+      `🌙 Pickleball tomorrow, ${CONFIG.game.label}.\n\nYou're bringing ${guests
         .map((g) => `<b>${esc(g.name)}</b>`)
-        .join(' and ')}. Still coming?\n\nNo need to reply if nothing's changed — this is just a chance to free the spot early if it is.`,
+        .join(' and ')}. Still good?\n\nIgnore this if nothing's changed.`,
       { reply_markup: { inline_keyboard: rows } },
       'guest'
     );
@@ -1081,8 +1088,8 @@ async function handleCallback(env, cb) {
     await saveWeek(env, week); // persist the stored claim link
 
     const personal = link
-      ? `➕ You're holding a spot for <b>${esc(label)}</b>.\n\n<b>Invite them:</b> send this link — it's unique to them and works once.\n${link}\n\nTapping it adds them to the group and turns the placeholder into their name, so they can confirm or cancel for themselves.\n\nHandy to paste alongside it:\n<i>Pickleball ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}. Roster + sign-up: ${CONFIG.webUrl}</i>`
-      : `➕ You added <b>${esc(label)}</b>. (Couldn't create an invite link — check I'm an admin with "Invite Users via Link".)`;
+      ? `✅ Spot saved for your guest.\n\nSend them this:\n\n<i>Pickleball ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}. You're on the list — tap to join us: ${link}</i>\n\nThat link is just for them and works once. When they tap it they're in the group and the spot becomes theirs.`
+      : `➕ Added <b>${esc(label)}</b>. I couldn't make an invite link though — check I'm an admin with "Invite Users via Link".`;
 
     // Instructions are for the sponsor only; the group just needs the count.
     const sentPrivately = await dmUser(env, from.id, personal, {}, 'guest');
@@ -1130,6 +1137,17 @@ async function handleCallback(env, cb) {
     const pos = week.players.length;
     const court = Math.floor((pos - 1) / CONFIG.playersPerCourt) + 1;
     await postChange(env, chatConf.chatId, week, `✅ <b>${esc(fullName(from))}</b> is in.\n${headcountLine(week)}`);
+    await dmUser(
+      env,
+      from.id,
+      `🏓 You're in for <b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)}.`,
+      {
+        reply_markup: {
+          inline_keyboard: [[{ text: '📅 Add to calendar', url: `${CONFIG.calendarUrl}?date=${week.date}` }]],
+        },
+      },
+      'reminders'
+    );
     return answer(`You're in — #${pos}, Court ${court}.`);
   }
 
@@ -1217,7 +1235,7 @@ async function handleCommand(env, msg) {
     }
     buttons.push([{ text: '🔔 Manage notifications', callback_data: 'pref:show' }]);
     return say(
-      `🔔 <b>You're set up for personal updates.</b>\nI'll message you here when a spot opens for you, when you're promoted onto a court, or when your guest claims their spot — instead of filling up the group chat.\n\nSend /notifications any time to choose what I message you about.`,
+      `🔔 You're all set.\n\nI'll ping you here when a spot opens up, when you move onto a court, or when your guest joins — so the group chat stays quiet.\n\n/notifications to change what I send you.`,
       { reply_markup: { inline_keyboard: buttons } }
     );
   }
@@ -1272,6 +1290,61 @@ async function handleCommand(env, msg) {
 
   // Organiser escape hatch: remove ANY roster entry by name. Covers guests,
   // no-shows, and legacy web signups that nothing else can clear.
+  // Opens the Mini App (admin controls live in there for group admins).
+  if (cmd === '/manage') {
+    return say('Roster controls:', {
+      reply_markup: { inline_keyboard: [[{ text: '🛠 Open roster', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] },
+    });
+  }
+
+  if (cmd === '/calendar') {
+    const week = await getWeek(env, activeGameDate(new Date()));
+    return say(`📅 ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}`, {
+      reply_markup: { inline_keyboard: [[{ text: '📅 Add to calendar', url: `${CONFIG.calendarUrl}?date=${week.date}` }]] },
+    });
+  }
+
+  if (cmd === '/setlocation' || cmd === '/settime' || cmd === '/setcourts') {
+    if (msg.chat.type !== 'private') {
+      const m = await tg(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
+      const st = m.ok ? m.result.status : 'unknown';
+      if (st !== 'creator' && st !== 'administrator') return say('Admins only.');
+    }
+    const value = args.join(' ').trim();
+    const current = (await kvGet(env, 'settings')) || {};
+    if (!value) {
+      return say(
+        `Current: <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}, ${CONFIG.game.courts} courts.\n` +
+          'Usage: /setlocation Name | https://maps-link · /settime 6:30 AM · /setcourts 3'
+      );
+    }
+    if (cmd === '/setlocation') {
+      const [name, mapUrl] = value.split('|').map((x) => x.trim());
+      current.location = name;
+      if (mapUrl) current.mapUrl = mapUrl;
+      else current.mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
+    } else if (cmd === '/settime') {
+      const hour = parseInt(value, 10);
+      if (Number.isNaN(hour)) return say('Try: /settime 6:30 AM');
+      const pm = /pm/i.test(value);
+      current.label = value;
+      current.hour = pm && hour < 12 ? hour + 12 : !pm && hour === 12 ? 0 : hour;
+    } else {
+      const n = parseInt(value, 10);
+      if (Number.isNaN(n) || n < 1 || n > 12) return say('Try: /setcourts 4');
+      current.courts = n;
+    }
+    await kvPut(env, 'settings', current);
+    Object.assign(CONFIG.game, current);
+    const week = await getWeek(env, activeGameDate(new Date()));
+    await say(
+      `✅ Updated. Now: <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}, ${CONFIG.game.courts} courts.`
+    );
+    const conf = await kvGet(env, 'chat');
+    if (conf) await refreshRoster(env, conf.chatId, week, { repost: true });
+    return;
+  }
+
   if (cmd === '/kick') {
     const name = args.join(' ').trim();
     if (!name) return say('Usage: /kick Name — removes anyone from this week\'s roster.');
@@ -1434,6 +1507,7 @@ async function handleScheduled(env) {
 
 export default {
   async fetch(request, env) {
+    await applySettings(env);
     const url = new URL(request.url);
 
     if (url.pathname === '/webhook' && request.method === 'POST') {
@@ -1458,6 +1532,35 @@ export default {
         console.log(`update error: ${err.stack || err.message}`);
       }
       return new Response('ok'); // always 200 so Telegram doesn't retry-loop
+    }
+
+    // --- Calendar file for the game (add-to-calendar links point here) ---
+    if (url.pathname === '/event.ics') {
+      const date = (url.searchParams.get('date') || activeGameDate(new Date())).replace(/-/g, '');
+      const hh = String(CONFIG.game.hour).padStart(2, '0');
+      const endHh = String((CONFIG.game.hour + 2) % 24).padStart(2, '0');
+      const ics = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//pickleball-bot//EN',
+        'CALSCALE:GREGORIAN',
+        'BEGIN:VEVENT',
+        `UID:pickleball-${date}@pickleball-bot`,
+        `DTSTAMP:${date}T000000Z`,
+        `DTSTART;TZID=${CONFIG.timezone}:${date}T${hh}0000`,
+        `DTEND;TZID=${CONFIG.timezone}:${date}T${endHh}0000`,
+        'SUMMARY:🏓 Pickleball',
+        `LOCATION:${CONFIG.game.location}`,
+        `DESCRIPTION:Roster and sign-up: ${CONFIG.miniAppUrl || CONFIG.webUrl}`,
+        'END:VEVENT',
+        'END:VCALENDAR',
+      ].join('\r\n');
+      return new Response(ics, {
+        headers: {
+          'content-type': 'text/calendar; charset=utf-8',
+          'content-disposition': `attachment; filename="pickleball-${date}.ics"`,
+        },
+      });
     }
 
     // --- Re-register the webhook and report bot permissions ---
@@ -1673,7 +1776,7 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(handleScheduled(env));
+    ctx.waitUntil(applySettings(env).then(() => handleScheduled(env)));
   },
 };
 
