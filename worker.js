@@ -58,7 +58,7 @@ const CONFIG = {
   // button open *inside* Telegram — that path also passes a signed initData,
   // which unlocks the personalised "(me)" view. Falls back to webUrl.
   webUrl: 'https://pickleball-bot.jmartin84.workers.dev/signup',
-  miniAppUrl: '',
+  miniAppUrl: 'https://t.me/BicklePallBot/dink',
 
   // Automation moments, in local (Pacific) time. Each fires once per game
   // week (idempotent), matched within a 15-minute cron window.
