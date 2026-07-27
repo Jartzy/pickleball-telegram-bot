@@ -1,5 +1,5 @@
 // Edge-case QA for court grouping, labels, cap and cascade.
-import { groupPlayersIntoCourts, rosterText, describeCascade, CONFIG } from
+import { groupPlayersIntoCourts, rosterText, describeCascade, lastCallState, activeSlots, CONFIG } from
   './worker.js';
 
 const SIZE = CONFIG.playersPerCourt;
@@ -87,6 +87,28 @@ for (const n of [0, 4, 5, 16]) {
   check(`n=${n} renders headcount`, t.includes(`${n} in`), t.split('\n').pop());
   check(`n=${n} shows venue courts`, t.includes(`${CONFIG.game.courts} courts`));
   if (n === 0) check('empty roster invites first signup', /Nobody signed up/.test(t));
+}
+
+console.log('\n== last-call branch (Wed 7pm) ==');
+{
+  const w = (n) => ({ date: '2026-07-30', phase: 'urgent', players: mk(n), msgId: null });
+  check('0 signed up -> short (NOT "set")', lastCallState(w(0)) === 'short', lastCallState(w(0)));
+  check('1 signed up -> short', lastCallState(w(1)) === 'short');
+  check('3 signed up -> short', lastCallState(w(3)) === 'short');
+  check('4 signed up -> set', lastCallState(w(4)) === 'set', lastCallState(w(4)));
+  check('5 signed up -> recruit', lastCallState(w(5)) === 'recruit', lastCallState(w(5)));
+  check('8 signed up -> set', lastCallState(w(8)) === 'set');
+  check('16 signed up -> set', lastCallState(w(16)) === 'set');
+}
+
+console.log('\n== schedule derives from game time ==');
+{
+  const ids = activeSlots().map((s) => s.id);
+  check('five slots', ids.length === 5, ids.join(','));
+  const final = activeSlots().find((s) => s.id === 'final');
+  check('final is one hour before the game', final.hour === (CONFIG.game.hour + 23) % 24, String(final.hour));
+  const open = activeSlots().find((s) => s.id === 'open');
+  check('open is after the game has rolled over', open.hour === (CONFIG.game.hour + 2) % 24, String(open.hour));
 }
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURES'}\n`);

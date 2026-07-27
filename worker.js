@@ -872,6 +872,19 @@ async function announceWeb(env, chatId, week, line) {
   await postChange(env, chatId, week, `${line}\n${headcountLine(week)}`);
 }
 
+/**
+ * Which last-call message applies:
+ *   'short'   — not even one full court yet, the game is at risk
+ *   'recruit' — a court is part-filled, chase the remaining spots
+ *   'set'     — every court that exists is full
+ * Explicit, because an empty roster produces no courts at all and used to
+ * fall through to "we're set".
+ */
+function lastCallState(week) {
+  if (week.players.length < CONFIG.playersPerCourt) return 'short';
+  return groupPlayersIntoCourts(week.players).some((c) => !c.isConfirmed) ? 'recruit' : 'set';
+}
+
 /** Hard ceiling on sign-ups: every court at the venue, full. */
 function maxPlayers() {
   return CONFIG.game.courts * CONFIG.playersPerCourt;
@@ -1539,8 +1552,19 @@ async function runSlot(env, slotId, now) {
   if (slotId === 'lastcall') {
     week.phase = 'urgent';
     await saveWeek(env, week);
-    const courts = groupPlayersIntoCourts(week.players);
-    if (courts.some((c) => !c.isConfirmed)) {
+    const state = lastCallState(week);
+    if (state === 'short') {
+      const need = CONFIG.playersPerCourt - week.players.length;
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text:
+          week.players.length === 0
+            ? `🚨 <b>${label}</b> — nobody's signed up yet.\n\nWe need ${CONFIG.playersPerCourt} to play. If you're keen, say so tonight, otherwise it's off.`
+            : `🚨 <b>${label}</b> — only ${week.players.length} of us so far, ${need} short of a court.\n\nGrab a mate or shout tonight, otherwise we'll call it off.`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rosterKeyboard(week).inline_keyboard },
+      });
+    } else if (state === 'recruit') {
       await sendRecruitingAlert(env, chatId, week, `⏰ <b>Last call for ${label}.</b>`);
     } else {
       await tg(env, 'sendMessage', {
@@ -1918,4 +1942,4 @@ export default {
 };
 
 // Exported for tests.
-export { groupPlayersIntoCourts, rosterText, describeCascade, activeGameDate, localParts, CONFIG };
+export { groupPlayersIntoCourts, rosterText, describeCascade, activeGameDate, localParts, lastCallState, activeSlots, CONFIG };
