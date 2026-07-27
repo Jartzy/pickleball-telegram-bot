@@ -68,15 +68,26 @@ const CONFIG = {
   webhookUrl: 'https://pickleball-bot.jmartin84.workers.dev/webhook',
   calendarUrl: 'https://pickleball-bot.jmartin84.workers.dev/event.ics',
 
-  // Automation moments, in local (Pacific) time. Each fires once per game
-  // week (idempotent), matched within a 15-minute cron window.
-  slots: [
-    { id: 'open', weekday: 'Thu', hour: 8, minute: 0 },
-    { id: 'rollcall', weekday: 'Wed', hour: 19, minute: 0 },
-    { id: 'cutoff', weekday: 'Wed', hour: 21, minute: 30 },
-    { id: 'final', weekday: 'Thu', hour: 5, minute: 15 },
-  ],
+  // Slot times are derived from the game time — see activeSlots().
 };
+
+/**
+ * Automation moments, in local time. Derived from the game time so moving the
+ * game (e.g. to 8am) moves the final roster and the re-open with it.
+ * Each fires once per game week; the cron ticks every 15 minutes.
+ */
+function activeSlots() {
+  const g = CONFIG.game;
+  return [
+    // Sign-ups for next week, safely after this week's game has rolled over.
+    { id: 'open', weekday: g.weekday, hour: (g.hour + 2) % 24, minute: 0 },
+    { id: 'rollcall-mon', weekday: 'Mon', hour: 8, minute: 0 },
+    { id: 'rollcall-wed', weekday: 'Wed', hour: 8, minute: 0 },
+    { id: 'lastcall', weekday: 'Wed', hour: 19, minute: 0 },
+    // One hour before the game, whatever time that is.
+    { id: 'final', weekday: g.weekday, hour: (g.hour + 23) % 24, minute: 0 },
+  ];
+}
 
 // ============================================================================
 // TIME HELPERS — everything is computed in the configured timezone
@@ -200,6 +211,42 @@ async function kvPut(env, key, value) {
   await env.PICKLE_KV.put(key, JSON.stringify(value));
 }
 
+/**
+ * The UTC instant for a wall-clock hour on a given local date. Probing offsets
+ * avoids hard-coding a daylight-saving rule.
+ */
+function utcForLocal(dateStr, hour) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  for (let off = -14; off <= 14; off++) {
+    const t = Date.UTC(y, m - 1, d, hour + off);
+    const p = localParts(new Date(t));
+    if (`${p.y}-${p.mo}-${p.d}` === dateStr && p.hour === hour) return new Date(t);
+  }
+  return new Date(Date.UTC(y, m - 1, d, hour));
+}
+
+function icsStamp(date) {
+  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+/** Google Calendar prefills via URL; Apple/Outlook take the .ics file. */
+function calendarButtons(week) {
+  const start = utcForLocal(week.date, CONFIG.game.hour);
+  const end = new Date(start.getTime() + 2 * 3600 * 1000);
+  const g =
+    'https://calendar.google.com/calendar/render?action=TEMPLATE' +
+    `&text=${encodeURIComponent('🏓 Pickleball')}` +
+    `&dates=${icsStamp(start)}/${icsStamp(end)}` +
+    `&location=${encodeURIComponent(CONFIG.game.location)}` +
+    `&details=${encodeURIComponent(`Roster: ${CONFIG.miniAppUrl || CONFIG.webUrl}`)}`;
+  return [
+    [
+      { text: '📅 Google', url: g },
+      { text: '🍎 Apple / other', url: `${CONFIG.calendarUrl}?date=${week.date}` },
+    ],
+  ];
+}
+
 /** "6:30 PM" -> 18. Returns null when it cannot be read. */
 function parseHour(label) {
   const h = parseInt(label, 10);
@@ -211,7 +258,9 @@ function parseHour(label) {
 /** Applies any admin overrides (venue, time, courts) over the compiled config. */
 async function applySettings(env) {
   const o = await kvGet(env, 'settings');
-  if (o) Object.assign(CONFIG.game, o);
+  if (!o) return;
+  if (o.perCourt) CONFIG.playersPerCourt = o.perCourt;
+  Object.assign(CONFIG.game, o);
 }
 
 async function getWeek(env, date) {
@@ -404,6 +453,8 @@ function signupPageHtml(week, done, viewer = null) {
       <input name="mapUrl" value="${esc(CONFIG.game.mapUrl)}" placeholder="Map link" maxlength="300"/>
       <input name="label" value="${esc(CONFIG.game.label)}" placeholder="Time, e.g. 6:00 AM" maxlength="20"/>
       <input name="courts" value="${CONFIG.game.courts}" placeholder="Courts" type="number" min="1" max="12"/>
+      <input name="perCourt" value="${CONFIG.playersPerCourt}" placeholder="Players per court" type="number" min="2" max="8"/>
+      <p class="fine">${CONFIG.game.courts} courts × ${CONFIG.playersPerCourt} = ${maxPlayers()} spots. Minimum to play: ${CONFIG.playersPerCourt}.</p>
       <button name="action" value="settings" class="guest wide">💾 Save event details</button>
       <p class="fine">Changing the time also moves the reminders and the calendar invite.</p>
     </form>`;
@@ -1159,11 +1210,7 @@ async function handleCallback(env, cb) {
       env,
       from.id,
       `🏓 You're in for <b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)}.`,
-      {
-        reply_markup: {
-          inline_keyboard: [[{ text: '📅 Add to calendar', url: `${CONFIG.calendarUrl}?date=${week.date}` }]],
-        },
-      },
+      { reply_markup: { inline_keyboard: calendarButtons(week) } },
       'reminders'
     );
     return answer(`You're in — #${pos}, Court ${court}.`);
@@ -1318,7 +1365,7 @@ async function handleCommand(env, msg) {
   if (cmd === '/calendar') {
     const week = await getWeek(env, activeGameDate(new Date()));
     return say(`📅 ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}`, {
-      reply_markup: { inline_keyboard: [[{ text: '📅 Add to calendar', url: `${CONFIG.calendarUrl}?date=${week.date}` }]] },
+      reply_markup: { inline_keyboard: calendarButtons(week) },
     });
   }
 
@@ -1456,22 +1503,32 @@ async function runSlot(env, slotId, now) {
   const label = `${fmtGameDate(week.date)}, ${CONFIG.game.label}`;
 
   if (slotId === 'open') {
-    // Fires Thu 8am — activeGameDate has already rolled to NEXT week.
-    week.msgId = null; // force a fresh message
+    // Fires after this week's game, so activeGameDate has rolled to NEXT week.
+    week.msgId = null;
     await tg(env, 'sendMessage', {
       chat_id: chatId,
-      text: `🏓 <b>Sign-ups are open for ${label}!</b>\nLock in early — first to confirm, first on Court 1.`,
+      text: `🏓 <b>${label}</b> is open. First in, first on court.`,
       parse_mode: 'HTML',
     });
     await refreshRoster(env, chatId, week, { repost: true });
     await saveWeek(env, week);
   }
 
-  if (slotId === 'rollcall') {
+  if (slotId === 'rollcall-mon') {
+    await tg(env, 'sendMessage', {
+      chat_id: chatId,
+      text: `🏓 <b>${label}</b> — who's playing?\n${headcountLine(week)}\n\nIn or out below. Sorting it now beats sorting it Wednesday night.`,
+      parse_mode: 'HTML',
+    });
+    await refreshRoster(env, chatId, week, { repost: true });
+    await saveWeek(env, week);
+  }
+
+  if (slotId === 'rollcall-wed') {
     week.phase = 'rollcall';
     await tg(env, 'sendMessage', {
       chat_id: chatId,
-      text: `🌙 <b>Roll call — pickleball tomorrow, ${CONFIG.game.label}!</b>\nConfirm below. No response by 9:30pm = your spot may go to standby.`,
+      text: `⏳ Two days out — <b>${label}</b>.\n${headcountLine(week)}`,
       parse_mode: 'HTML',
     });
     await refreshRoster(env, chatId, week, { repost: true });
@@ -1479,18 +1536,46 @@ async function runSlot(env, slotId, now) {
     await askSponsorsToConfirmGuests(env, week);
   }
 
-  if (slotId === 'cutoff') {
+  if (slotId === 'lastcall') {
     week.phase = 'urgent';
     await saveWeek(env, week);
     const courts = groupPlayersIntoCourts(week.players);
     if (courts.some((c) => !c.isConfirmed)) {
-      await sendRecruitingAlert(env, chatId, week, `⏰ <b>Last call for ${label}!</b>`);
+      await sendRecruitingAlert(env, chatId, week, `⏰ <b>Last call for ${label}.</b>`);
+    } else {
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: `✅ <b>${label}</b> is set.\n${headcountLine(week)}\n\nIf something's come up, say so tonight — someone else can take the spot.`,
+        parse_mode: 'HTML',
+      });
     }
   }
 
   if (slotId === 'final') {
+    const size = CONFIG.playersPerCourt;
+    // Not enough for a single court: tell the people who signed up directly
+    // rather than letting them turn up to nobody.
+    if (week.players.length < size) {
+      const short = size - week.players.length;
+      const names = week.players.map((p) => p.name).join(', ') || 'nobody';
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: `⚠️ <b>${label}</b> — we're ${short} short.\nOn the list: ${esc(names)}.\n\nIf you still want to play, sort it between you in the next few minutes. Otherwise treat this week as off.`,
+        parse_mode: 'HTML',
+      });
+      for (const p of week.players) {
+        if (!p.id) continue;
+        await dmUser(
+          env,
+          p.id,
+          `⚠️ Only ${week.players.length} signed up for <b>${label}</b> — ${short} short of a court.\n\nStill keen? Say so in the group now. Otherwise assume it's off this week.`,
+          {},
+          'reminders'
+        );
+      }
+    }
     week.phase = 'final';
-    week.msgId = null; // fresh, un-editable final post
+    week.msgId = null;
     await refreshRoster(env, chatId, week, { repost: true });
     await saveWeek(env, week);
   }
@@ -1500,7 +1585,7 @@ async function handleScheduled(env) {
   const now = new Date();
   const local = localParts(now);
 
-  for (const slot of CONFIG.slots) {
+  for (const slot of activeSlots()) {
     const inWindow =
       local.wd === slot.weekday &&
       local.hour === slot.hour &&
@@ -1633,7 +1718,7 @@ export default {
         return new Response('forbidden', { status: 403 });
       }
       const slot = url.searchParams.get('slot');
-      const valid = CONFIG.slots.map((s) => s.id);
+      const valid = activeSlots().map((s) => s.id);
       if (!valid.includes(slot)) {
         return new Response(`bad slot; use one of: ${valid.join(', ')}`, { status: 400 });
       }
@@ -1731,6 +1816,11 @@ export default {
                 }
               }
               if (!Number.isNaN(courts) && courts >= 1 && courts <= 12) next.courts = courts;
+              const perCourt = parseInt((form.get('perCourt') || '').toString(), 10);
+              if (!Number.isNaN(perCourt) && perCourt >= 2 && perCourt <= 8) {
+                next.perCourt = perCourt;
+                CONFIG.playersPerCourt = perCourt;
+              }
               if (!note) {
                 await kvPut(env, 'settings', next);
                 Object.assign(CONFIG.game, next);
