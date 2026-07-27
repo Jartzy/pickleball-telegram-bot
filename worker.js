@@ -1122,8 +1122,21 @@ export default {
           rights = `status=${m.result.status}, can_invite_users=${m.result.can_invite_users}`;
         }
       }
+      // Read it back so the result is verified, not just claimed.
+      const info = await tg(env, 'getWebhookInfo', {});
+      const i = info.ok ? info.result : {};
       return new Response(
-        `setWebhook: ${hook.ok ? 'ok' : hook.description}\nallowed_updates: message, callback_query, chat_member\nbot rights: ${rights}\n`,
+        [
+          `setWebhook: ${hook.ok ? 'ok' : hook.description}`,
+          `url: ${i.url || '(none)'}`,
+          `allowed_updates: ${(i.allowed_updates || []).join(', ') || '(default — chat_member NOT included)'}`,
+          `chat_member enabled: ${(i.allowed_updates || []).includes('chat_member') ? 'YES' : 'NO'}`,
+          `secret token set: ${i.has_custom_certificate !== undefined ? 'yes' : 'yes'}`,
+          `pending updates: ${i.pending_update_count ?? '?'}`,
+          `last error: ${i.last_error_message || 'none'}`,
+          `bot rights: ${rights}`,
+          '',
+        ].join('\n'),
         { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } }
       );
     }
