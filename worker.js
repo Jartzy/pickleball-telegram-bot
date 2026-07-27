@@ -200,6 +200,14 @@ async function kvPut(env, key, value) {
   await env.PICKLE_KV.put(key, JSON.stringify(value));
 }
 
+/** "6:30 PM" -> 18. Returns null when it cannot be read. */
+function parseHour(label) {
+  const h = parseInt(label, 10);
+  if (Number.isNaN(h)) return null;
+  const pm = /pm/i.test(label);
+  return pm && h < 12 ? h + 12 : !pm && h === 12 ? 0 : h;
+}
+
 /** Applies any admin overrides (venue, time, courts) over the compiled config. */
 async function applySettings(env) {
   const o = await kvGet(env, 'settings');
@@ -389,6 +397,16 @@ function signupPageHtml(week, done, viewer = null) {
     }
   }
   if (viewer && viewer.isAdmin) {
+    b += `<form method="POST" action="/signup" class="rename">
+      <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
+      <label>Event settings</label>
+      <input name="location" value="${esc(CONFIG.game.location)}" placeholder="Location" maxlength="60"/>
+      <input name="mapUrl" value="${esc(CONFIG.game.mapUrl)}" placeholder="Map link" maxlength="300"/>
+      <input name="label" value="${esc(CONFIG.game.label)}" placeholder="Time, e.g. 6:00 AM" maxlength="20"/>
+      <input name="courts" value="${CONFIG.game.courts}" placeholder="Courts" type="number" min="1" max="12"/>
+      <button name="action" value="settings" class="guest wide">💾 Save event details</button>
+      <p class="fine">Changing the time also moves the reminders and the calendar invite.</p>
+    </form>`;
     b += `<p class="adminbar">🛠 <b>Admin controls</b> — only you can see these. The ✕ next to a name removes them (and any guests they brought).</p>`;
   }
   if (viewer) {
@@ -1324,11 +1342,10 @@ async function handleCommand(env, msg) {
       if (mapUrl) current.mapUrl = mapUrl;
       else current.mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
     } else if (cmd === '/settime') {
-      const hour = parseInt(value, 10);
-      if (Number.isNaN(hour)) return say('Try: /settime 6:30 AM');
-      const pm = /pm/i.test(value);
+      const hour = parseHour(value);
+      if (hour === null) return say('Try: /settime 6:30 AM');
       current.label = value;
-      current.hour = pm && hour < 12 ? hour + 12 : !pm && hour === 12 ? 0 : hour;
+      current.hour = hour;
     } else {
       const n = parseInt(value, 10);
       if (Number.isNaN(n) || n < 1 || n > 12) return say('Try: /setcourts 4');
@@ -1693,6 +1710,34 @@ export default {
             viewer.inviteLink = await mintGuestInvite(env, groupId, week, guest);
             note = `Added ${label}.`;
             announce = `➕ <b>${esc(who)}</b> added <b>${esc(label)}</b>.`;
+          } else if (action === 'settings') {
+            if (!viewer.isAdmin) {
+              note = 'Only group admins can change the event details.';
+            } else {
+              const next = (await kvGet(env, 'settings')) || {};
+              const loc = (form.get('location') || '').toString().trim().slice(0, 60);
+              const mapUrl = (form.get('mapUrl') || '').toString().trim().slice(0, 300);
+              const label = (form.get('label') || '').toString().trim().slice(0, 20);
+              const courts = parseInt((form.get('courts') || '').toString(), 10);
+              if (loc) next.location = loc;
+              next.mapUrl = mapUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
+              if (label) {
+                const h = parseHour(label);
+                if (h === null) {
+                  note = 'Could not read that time — try something like "6:00 AM".';
+                } else {
+                  next.label = label;
+                  next.hour = h;
+                }
+              }
+              if (!Number.isNaN(courts) && courts >= 1 && courts <= 12) next.courts = courts;
+              if (!note) {
+                await kvPut(env, 'settings', next);
+                Object.assign(CONFIG.game, next);
+                note = 'Event details updated.';
+                announce = `📍 Now at <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}.`;
+              }
+            }
           } else if (action === 'rename') {
             const gk = (form.get('guestKey') || '').toString();
             const newName = (form.get('newName') || '').toString().trim().slice(0, 40);
@@ -1752,7 +1797,7 @@ export default {
             }
             await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
           }
-          if (['in', 'out', 'guest', 'dropguest', 'rename'].includes(action)) {
+          if (['in', 'out', 'guest', 'dropguest', 'rename', 'settings'].includes(action)) {
             await saveWeek(env, week);
             await postChange(env, chatConf.chatId, week, announce ? `${announce}\n${headcountLine(week)}` : null);
           }
