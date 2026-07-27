@@ -482,7 +482,13 @@ async function refreshRoster(env, chatId, week, { repost = false } = {}) {
     reply_markup: keyboard,
   });
   if (res.ok) {
+    const prevMsgId = week.msgId;
     week.msgId = res.result.message_id;
+    // Retire the previous roster pin first — otherwise every repost stacks up
+    // and the pinned list fills with stale rosters.
+    if (prevMsgId && prevMsgId !== week.msgId) {
+      await tg(env, 'unpinChatMessage', { chat_id: chatId, message_id: prevMsgId });
+    }
     // Pinning keeps the live roster easy to find; ignore failure if the bot
     // isn't an admin.
     await tg(env, 'pinChatMessage', { chat_id: chatId, message_id: week.msgId, disable_notification: true });
@@ -652,6 +658,9 @@ async function announceWeb(env, chatId, week, line) {
     chat_id: chatId,
     text: `${line}\n${headcountLine(week)}`,
     parse_mode: 'HTML',
+    // Carry the actions so people can respond right here rather than hunting
+    // for the pinned roster.
+    reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(),
   });
 }
 
@@ -884,10 +893,37 @@ async function handleCommand(env, msg) {
   const from = msg.from;
   const say = (t, extra = {}) => tg(env, 'sendMessage', { chat_id: chatId, text: t, parse_mode: 'HTML', ...extra });
 
-  // Opening the bot in a DM is the opt-in: record the private chat so we can
-  // message this person directly from now on.
-  if (cmd === '/start' && msg.chat.type === 'private') {
+  // ANY private message proves we can reach this person, so record the chat.
+  // (People who pressed Start before this existed were never captured.)
+  if (msg.chat.type === 'private') {
     await kvPut(env, `dm:${from.id}`, { chatId, name: fullName(from) });
+  }
+
+  // Sandbox: point the bot at this DM so testing doesn't spam the group.
+  if (cmd === '/testmode' && msg.chat.type === 'private') {
+    const live = await kvGet(env, 'chat');
+    if (live && live.chatId !== chatId) await kvPut(env, 'chat:live', live);
+    await kvPut(env, 'chat', { chatId });
+    const week = await getWeek(env, activeGameDate(new Date()));
+    week.msgId = null; // the live roster message lives in the group
+    await saveWeek(env, week);
+    return say(
+      '🧪 <b>Test mode on.</b> Every bot message now comes here instead of the group, so you can poke at things without spamming anyone.\n\nThe roster data is shared — changes you make here are real. Send /livemode when you\'re done.'
+    );
+  }
+
+  if (cmd === '/livemode' && msg.chat.type === 'private') {
+    const live = await kvGet(env, 'chat:live');
+    if (!live) return say('No saved group binding — run /setup inside the group.');
+    await kvPut(env, 'chat', live);
+    await env.PICKLE_KV.delete('chat:live');
+    const week = await getWeek(env, activeGameDate(new Date()));
+    week.msgId = null; // force a fresh roster post back in the group
+    await saveWeek(env, week);
+    return say('✅ <b>Back to live.</b> Messages go to the group again.');
+  }
+
+  if (cmd === '/start' && msg.chat.type === 'private') {
     const buttons = [];
     if (CONFIG.telegramInviteUrl) {
       buttons.push([{ text: '👥 Join the group', url: CONFIG.telegramInviteUrl }]);
@@ -1270,6 +1306,7 @@ export default {
                 chat_id: chatConf.chatId,
                 text: `${announce}\n${headcountLine(week)}`,
                 parse_mode: 'HTML',
+                reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(),
               });
             }
           }
