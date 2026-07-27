@@ -248,9 +248,9 @@ function joinOutcome(week) {
 
 function joinLabel(week) {
   if (isFull(week)) return `🚫 Courts full`;
-  const { court, needAfter, fills } = joinOutcome(week);
-  if (fills) return `✅ I'm in — fills Court ${court}!`;
-  return `✅ I'm in — Court ${court}, ${needAfter} more`;
+  const { needAfter, fills } = joinOutcome(week);
+  if (fills) return `✅ I'm in — completes a court!`;
+  return `✅ I'm in — ${needAfter} more needed`;
 }
 
 function rosterKeyboard(week) {
@@ -586,7 +586,7 @@ function headcountLine(week) {
   const partial = courts.find((c) => !c.isConfirmed);
   let s = `👥 ${week.players.length} in`;
   if (confirmed) s += ` · ${confirmed} court${confirmed === 1 ? '' : 's'} confirmed`;
-  if (partial) s += ` · Court ${partial.courtNumber} needs ${partial.playersNeeded} more`;
+  if (partial) s += ` · ${partial.playersNeeded} more to fill the next`;
   return s;
 }
 
@@ -887,9 +887,41 @@ function describeCascade(beforePlayers, week, removedNames) {
   const partial = courts.find((c) => !c.isConfirmed);
   if (partial) {
     const n = partial.playersNeeded;
-    lines.push(`Court ${partial.courtNumber} now needs <b>${n}</b> more player${n === 1 ? '' : 's'}.`);
+    lines.push(`We now need <b>${n}</b> more player${n === 1 ? '' : 's'}.`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Roll call for sponsors: privately ask each person bringing guests whether
+ * those guests are still coming, so unconfirmed spots can be freed early
+ * rather than discovered on the morning.
+ */
+async function askSponsorsToConfirmGuests(env, week) {
+  const bySponsor = new Map();
+  for (const p of week.players) {
+    if (!p.guestOf) continue;
+    if (!bySponsor.has(p.guestOf)) bySponsor.set(p.guestOf, []);
+    bySponsor.get(p.guestOf).push(p);
+  }
+
+  for (const [sponsorId, guests] of bySponsor) {
+    const rows = guests.map((g) => [
+      { text: `❌ ${g.name} can't make it`, callback_data: `gcancel:${g.key}` },
+    ]);
+    rows.unshift([{ text: `✅ All still coming`, callback_data: 'gconfirm' }]);
+    if (guests.length > 1) rows.push([{ text: '❌ Cancel all my guests', callback_data: 'gcancelall' }]);
+
+    await dmUser(
+      env,
+      sponsorId,
+      `🌙 <b>Roll call — pickleball tomorrow, ${CONFIG.game.label}</b>\n\nYou're bringing ${guests
+        .map((g) => `<b>${esc(g.name)}</b>`)
+        .join(' and ')}. Still coming?\n\nNo need to reply if nothing's changed — this is just a chance to free the spot early if it is.`,
+      { reply_markup: { inline_keyboard: rows } },
+      'guest'
+    );
+  }
 }
 
 /** Recruiting push: mention partial-court members + standby pool, add Claim button. */
@@ -935,6 +967,32 @@ async function handleCallback(env, cb) {
   const week = await getWeek(env, activeGameDate(new Date()));
   const from = cb.from;
 
+  if (cb.data === 'gconfirm') {
+    return answer('Great — nothing changed. Thanks for confirming!', true);
+  }
+
+  if (cb.data === 'gcancel' || cb.data === 'gcancelall' || cb.data.startsWith('gcancel:')) {
+    const all = cb.data === 'gcancelall';
+    const key = all ? null : cb.data.slice('gcancel:'.length);
+    const before = [...week.players];
+    const doomed = week.players.filter((p) =>
+      all ? p.guestOf === from.id : p.key === key && p.guestOf === from.id
+    );
+    if (doomed.length === 0) return answer('That guest is already off the roster.', true);
+    week.players = week.players.filter((p) => !doomed.includes(p));
+    await saveWeek(env, week);
+    const names = doomed.map((d) => d.name);
+    await postChange(
+      env,
+      chatConf.chatId,
+      week,
+      `❌ <b>${esc(names.join(', '))}</b> can no longer make it.\n${headcountLine(week)}`
+    );
+    await sendRecruitingAlert(env, chatConf.chatId, week, null);
+    await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
+    return answer(`Removed ${names.join(', ')}. Thanks for the heads-up!`, true);
+  }
+
   if (cb.data.startsWith('pref:')) {
     const which = cb.data.slice(5);
     const rec = (await getDmRecord(env, from.id)) || { chatId: cb.message && cb.message.chat.id };
@@ -966,6 +1024,9 @@ async function handleCallback(env, cb) {
   }
 
   if (cb.data === 'guest') {
+    if (!week.players.some((p) => p.key === `u:${from.id}`)) {
+      return answer("Tap \"I'm in\" first — guests are added under someone who's playing.", true);
+    }
     if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
     // One tap holds the spot under a placeholder name — no typing, no command.
     const sponsor = fullName(from);
@@ -1275,6 +1336,7 @@ async function runSlot(env, slotId, now) {
     });
     await refreshRoster(env, chatId, week, { repost: true });
     await saveWeek(env, week);
+    await askSponsorsToConfirmGuests(env, week);
   }
 
   if (slotId === 'cutoff') {
@@ -1463,6 +1525,8 @@ export default {
             note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
           } else if (action === 'in' && isFull(week)) {
             note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+          } else if (action === 'guest' && !week.players.some((p) => p.key === `u:${tgUser.id}`)) {
+            note = "Join first — guests are added under someone who's playing.";
           } else if (action === 'guest') {
             const label = nextGuestLabel(week, who);
             const guest = {

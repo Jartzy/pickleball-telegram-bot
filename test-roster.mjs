@@ -69,7 +69,8 @@ console.log('\n== drop cascade across a court boundary ==');
   const before = mk(4);
   const week = { date: '2026-07-30', phase: 'open', players: mk(4).filter((p) => p.key !== 'u:1'), msgId: null };
   const text = describeCascade(before, week, ['P1']);
-  check('4->3 reports court 1 needs 1 more', /needs.*1/is.test(text), JSON.stringify(text));
+  check('4->3 says we need 1 more', /need\D*<b>1<\/b>/is.test(text), JSON.stringify(text));
+  check('4->3 avoids court numbers in the shortage line', !/Court \d needs/i.test(text));
 }
 // 8 -> drop one: court 2 breaks
 {
