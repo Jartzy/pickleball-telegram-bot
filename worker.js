@@ -233,15 +233,36 @@ async function tg(env, method, params) {
   return data;
 }
 
-function rosterKeyboard() {
+/**
+ * What joining right now would actually do — so the button can say "fills
+ * Court 1!" instead of a bare "I'm in" that hides whether the game is on.
+ */
+function joinOutcome(week) {
+  const n = week.players.length;
+  const size = CONFIG.playersPerCourt;
+  const court = Math.floor(n / size) + 1;
+  const needAfter = size - ((n % size) + 1);
+  return { court, needAfter, fills: needAfter === 0 };
+}
+
+function joinLabel(week) {
+  const { court, needAfter, fills } = joinOutcome(week);
+  if (fills) return `✅ I'm in — fills Court ${court}!`;
+  return `✅ I'm in (Court ${court} · ${needAfter} more needed)`;
+}
+
+function rosterKeyboard(week) {
   return {
     inline_keyboard: [
       [
-        { text: "✅ I'm in", callback_data: 'in' },
+        { text: week ? joinLabel(week) : "✅ I'm in", callback_data: 'in' },
         { text: "❌ I can't make it", callback_data: 'out' },
       ],
       [{ text: '➕ Bring a guest', callback_data: 'guest' }],
-      [{ text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl }],
+      [
+        { text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl },
+        { text: '🔔 Personal updates', url: dmOptInUrl() },
+      ],
     ],
   };
 }
@@ -378,7 +399,7 @@ function signupPageHtml(week, done, viewer = null) {
       ${
         onRoster
           ? `<button name="action" value="out" class="out wide">❌ I can no longer go</button>`
-          : `<button name="action" value="in" class="in wide">✅ I'm in</button>`
+          : `<button name="action" value="in" class="in wide">${esc(joinLabel(week).replace('✅ ', ''))}</button>`
       }
       <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
     </form>`;
@@ -386,7 +407,7 @@ function signupPageHtml(week, done, viewer = null) {
     b += `<form method="POST" action="/signup" class="f">
       <input name="name" placeholder="Your name" required maxlength="40" autocomplete="name"/>
       <div class="btns">
-        <button name="action" value="in" class="in">✅ I'm in</button>
+        <button name="action" value="in" class="in">${esc(joinLabel(week).replace('✅ ', ''))}</button>
         <button name="action" value="out" class="out">❌ I'm out</button>
       </div>
       <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
@@ -402,10 +423,12 @@ function signupPageHtml(week, done, viewer = null) {
     b += `<div class="tg">
       <h2>📲 Get realtime updates</h2>
       <p>Roll call, last-minute open spots, and roster changes post live in our Telegram group.</p>
-      <ol>
-        <li>Install Telegram: <a href="https://telegram.org/apps" target="_blank" rel="noopener">telegram.org/apps</a></li>
-        ${joinStep}
-      </ol></div>`;
+      <p class="ctas">
+        <a class="cta cta1" href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">👥 Join the group</a>
+        <a class="cta cta2" href="${CONFIG.miniAppUrl || CONFIG.webUrl}" target="_blank" rel="noopener">🔔 Join &amp; get reminders</a>
+      </p>
+      <p class="fine">New to Telegram? <a href="https://telegram.org/apps" target="_blank" rel="noopener">Install it here</a> first — it's free.</p>
+      </div>`;
   }
   return `<!doctype html><html><head><meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -435,6 +458,11 @@ function signupPageHtml(week, done, viewer = null) {
   .share{margin-top:20px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
   .share h2{font-size:1rem;margin:0 0 6px}
   .share p{margin:0 0 8px;font-size:.9rem}
+  .ctas{display:flex;flex-direction:column;gap:8px;margin:10px 0 6px}
+  .cta{display:block;text-align:center;padding:12px;border-radius:8px;text-decoration:none;font-weight:600;font-size:.95rem}
+  .cta1{background:#2563eb;color:#fff}
+  .cta2{background:#16a34a;color:#fff}
+  .fine{font-size:.8rem;color:#555;margin:0}
   .snippet{background:#fff;border:1px dashed #d6d3d1;border-radius:8px;padding:10px;font-size:.85rem;word-break:break-word}
   </style></head><body${viewer ? ' data-tg="1"' : ''}>${b}
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -462,7 +490,7 @@ function signupPageHtml(week, done, viewer = null) {
 /** Edits the live roster message in place; falls back to posting a new one. */
 async function refreshRoster(env, chatId, week, { repost = false } = {}) {
   const text = rosterText(week);
-  const keyboard = week.phase === 'final' ? undefined : rosterKeyboard();
+  const keyboard = week.phase === 'final' ? undefined : rosterKeyboard(week);
 
   if (week.msgId && !repost) {
     const res = await tg(env, 'editMessageText', {
@@ -587,8 +615,12 @@ async function notifyPlayer(env, groupChatId, user, text, extra = {}) {
 // ---------------------------------------------------------------------------
 
 async function mintGuestInvite(env, chatId, week, player) {
+  // In test mode `chat` points at a DM, and you cannot mint an invite link for
+  // a private chat — always target the real group.
+  const live = await kvGet(env, 'chat:live');
+  const target = live ? live.chatId : chatId;
   const res = await tg(env, 'createChatInviteLink', {
-    chat_id: chatId,
+    chat_id: target,
     name: player.name.slice(0, 32),
     member_limit: 1, // single use: a forwarded link dies after the first join
   });
@@ -660,7 +692,7 @@ async function announceWeb(env, chatId, week, line) {
     parse_mode: 'HTML',
     // Carry the actions so people can respond right here rather than hunting
     // for the pinned roster.
-    reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(),
+    reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(week),
   });
 }
 
@@ -1306,7 +1338,7 @@ export default {
                 chat_id: chatConf.chatId,
                 text: `${announce}\n${headcountLine(week)}`,
                 parse_mode: 'HTML',
-                reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(),
+                reply_markup: week.phase === 'final' ? undefined : rosterKeyboard(week),
               });
             }
           }
