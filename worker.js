@@ -60,6 +60,12 @@ const CONFIG = {
   webUrl: 'https://pickleball-bot.jmartin84.workers.dev/signup',
   miniAppUrl: 'https://t.me/BicklePallBot/dink',
 
+  // Bot username, used to build deep links (t.me/<bot>?start=...). Opening the
+  // bot is what opts someone in to DMs — Telegram forbids a bot from messaging
+  // anyone who hasn't started it.
+  botUsername: 'BicklePallBot',
+  webhookUrl: 'https://pickleball-bot.jmartin84.workers.dev/webhook',
+
   // Automation moments, in local (Pacific) time. Each fires once per game
   // week (idempotent), matched within a 15-minute cron window.
   slots: [
@@ -527,6 +533,119 @@ function headcountLine(week) {
   return s;
 }
 
+// ---------------------------------------------------------------------------
+// DIRECT MESSAGES
+// A bot may only DM someone who has already opened it and pressed Start, so we
+// record each opted-in user's private chat id and fall back to a group mention.
+// ---------------------------------------------------------------------------
+
+async function getDmChat(env, userId) {
+  const v = await kvGet(env, `dm:${userId}`);
+  return v ? v.chatId : null;
+}
+
+/** DMs an opted-in user. Returns true when actually delivered. */
+async function dmUser(env, userId, text, extra = {}) {
+  const chatId = await getDmChat(env, userId);
+  if (!chatId) return false;
+  const res = await tg(env, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
+  return !!res.ok;
+}
+
+/** Deep link that opts a user in to DMs (and optionally carries a payload). */
+function dmOptInUrl(payload = 'dm') {
+  return `https://t.me/${CONFIG.botUsername}?start=${payload}`;
+}
+
+/**
+ * Tells one person something: privately when they've opted in, otherwise via a
+ * group @mention so they still get pinged. Keeps personal chatter out of the
+ * group whenever we're able to.
+ */
+async function notifyPlayer(env, groupChatId, user, text, extra = {}) {
+  if (await dmUser(env, user.id, text, extra)) return 'dm';
+  await tg(env, 'sendMessage', {
+    chat_id: groupChatId,
+    text: `${mention(user)} — ${text}`,
+    parse_mode: 'HTML',
+    ...extra,
+  });
+  return 'group';
+}
+
+// ---------------------------------------------------------------------------
+// GUEST CLAIM BY INVITE LINK
+// Each placeholder gets its own single-use group invite link. Telegram reports
+// which link a joiner used (ChatMemberUpdated.invite_link), so one tap both
+// joins the group and claims the spot — no tokens for anyone to paste.
+// ---------------------------------------------------------------------------
+
+async function mintGuestInvite(env, chatId, week, player) {
+  const res = await tg(env, 'createChatInviteLink', {
+    chat_id: chatId,
+    name: player.name.slice(0, 32),
+    member_limit: 1, // single use: a forwarded link dies after the first join
+  });
+  if (!res.ok) return null;
+  const link = res.result.invite_link;
+  await kvPut(env, `invite:${link}`, { date: week.date, key: player.key });
+  return link;
+}
+
+/** A new member joined — if they used a guest link, they claim that spot. */
+async function handleChatMember(env, upd) {
+  const oldStatus = upd.old_chat_member && upd.old_chat_member.status;
+  const newStatus = upd.new_chat_member && upd.new_chat_member.status;
+  const joined =
+    ['member', 'administrator', 'creator'].includes(newStatus) && ['left', 'kicked'].includes(oldStatus);
+  if (!joined) return;
+
+  const link = upd.invite_link && upd.invite_link.invite_link;
+  if (!link) return;
+  const rec = await kvGet(env, `invite:${link}`);
+  if (!rec) return;
+
+  const week = await getWeek(env, rec.date);
+  const idx = week.players.findIndex((p) => p.key === rec.key);
+  await env.PICKLE_KV.delete(`invite:${link}`); // one claim only
+  if (idx === -1) return; // placeholder already gone
+
+  const chatConf = await kvGet(env, 'chat');
+  if (!chatConf) return;
+  const user = upd.new_chat_member.user;
+  const placeholder = week.players[idx];
+  const sponsorId = placeholder.guestOf;
+  const sponsorName = placeholder.guestOfName;
+  const selfKey = `u:${user.id}`;
+
+  if (week.players.some((p) => p.key === selfKey)) {
+    week.players.splice(idx, 1); // they were already on under their own name
+  } else {
+    // Convert in place: same queue position, now their own identity, and no
+    // longer cascading off their sponsor.
+    week.players[idx] = { key: selfKey, id: user.id, name: fullName(user) };
+  }
+
+  await saveWeek(env, week);
+  await refreshRoster(env, chatConf.chatId, week);
+
+  const who = fullName(user);
+  await tg(env, 'sendMessage', {
+    chat_id: chatConf.chatId,
+    text: `🎉 <b>${esc(who)}</b> joined and claimed ${esc(sponsorName || 'a')}'s guest spot.\n${headcountLine(week)}`,
+    parse_mode: 'HTML',
+  });
+  if (sponsorId) {
+    await dmUser(env, sponsorId, `✅ <b>${esc(who)}</b> claimed the guest spot you saved. They manage their own attendance now.`);
+  }
+  await dmUser(
+    env,
+    user.id,
+    `👋 Welcome! You're on the roster for <b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)}.`,
+    { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
+  );
+}
+
 /** Posts a real (notifying) message about a roster change made off-Telegram. */
 async function announceWeb(env, chatId, week, line) {
   await tg(env, 'sendMessage', {
@@ -562,17 +681,64 @@ function removeMember(week, userId) {
  * This compares court assignments before vs. after and reports promotions
  * ("Eve moves up to Court 1") plus which court is now short.
  */
-function describeCascade(beforePlayers, week, removedNames) {
+/**
+ * Who moved up a court as a result of a drop. Returns the player objects (not
+ * just text) so each one can be told individually.
+ */
+function computePromotions(beforePlayers, week) {
   const before = new Map();
   beforePlayers.forEach((p, i) => before.set(p.key, Math.floor(i / CONFIG.playersPerCourt) + 1));
 
-  const promoted = [];
+  const moved = [];
   week.players.forEach((p, i) => {
     const court = Math.floor(i / CONFIG.playersPerCourt) + 1;
     if (before.has(p.key) && before.get(p.key) > court) {
-      promoted.push(`${p.name} moves up to Court ${court}`);
+      moved.push({ player: p, court, confirmed: groupPlayersIntoCourts(week.players)[court - 1]?.isConfirmed });
     }
   });
+  return moved;
+}
+
+/** Players sitting beyond the last full court — i.e. the backfill bench. */
+function waitlistDepth(week) {
+  return Math.max(0, week.players.length - confirmedCourtCount(week.players) * CONFIG.playersPerCourt);
+}
+
+/**
+ * Tells each promoted player the good news directly (DM when opted in, else a
+ * group @mention), including whether anyone is behind them to backfill.
+ */
+async function notifyPromotions(env, groupChatId, week, promotions) {
+  const depth = waitlistDepth(week);
+  for (const { player, court, confirmed } of promotions) {
+    // Guests have no Telegram identity — tell whoever is sponsoring them.
+    const targetId = player.id || player.guestOf;
+    if (!targetId) continue; // web-only signup: unreachable
+    const aboutGuest = !player.id && player.guestOf;
+
+    const headline = confirmed
+      ? `🎉 A spot opened up — ${aboutGuest ? `your guest <b>${esc(player.name)}</b> is` : `you're`} now <b>confirmed on Court ${court}</b>.`
+      : `⬆️ ${aboutGuest ? `Your guest <b>${esc(player.name)}</b> moved` : `You moved`} up to <b>Court ${court}</b>.`;
+
+    const tail =
+      confirmed && depth === 0
+        ? `\n\nJust so you know, there's nobody on the waitlist right now — if this spot opens up again the court would be short.`
+        : '';
+
+    await notifyPlayer(
+      env,
+      groupChatId,
+      { id: targetId, name: player.guestOfName || player.name },
+      `${headline}\n${fmtGameDate(week.date)}, ${CONFIG.game.label} · ${CONFIG.game.location}${tail}`,
+      { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
+    );
+  }
+}
+
+function describeCascade(beforePlayers, week, removedNames) {
+  const promoted = computePromotions(beforePlayers, week).map(
+    (m) => `${m.player.name} moves up to Court ${m.court}`
+  );
 
   const lines = [`⚠️ <b>${esc(removedNames.join(', '))}</b> can no longer make it.`];
   for (const move of promoted) lines.push(`⬆️ ${esc(move)}`);
@@ -636,12 +802,24 @@ async function handleCallback(env, cb) {
     await saveWeek(env, week);
     await refreshRoster(env, chatConf.chatId, week);
 
-    const invite = CONFIG.telegramInviteUrl
-      ? `\nIf they'd like to become a regular, send them this link: ${CONFIG.telegramInviteUrl}\nOnce they join they can tap ✅ I'm in, then free the placeholder with <code>/unguest ${esc(label)}</code>.`
-      : '';
+    // One-use link bound to THIS placeholder: tapping it joins the group and
+    // claims this exact spot.
+    const player = week.players[week.players.length - 1];
+    const link = await mintGuestInvite(env, chatConf.chatId, week, player);
+
+    const personal = link
+      ? `➕ You added <b>${esc(label)}</b>.\n\nSend them this link — it's unique to this guest and works once:\n${link}\n\nWhen they tap it they'll join the group and take over this spot automatically.`
+      : `➕ You added <b>${esc(label)}</b>. (Couldn't create an invite link — check I'm an admin with "Invite Users via Link".)`;
+
+    // Instructions are for the sponsor only; the group just needs the count.
+    const sentPrivately = await dmUser(env, from.id, personal);
     await tg(env, 'sendMessage', {
       chat_id: chatConf.chatId,
-      text: `➕ ${mention({ id: from.id, name: sponsor })} — I've added <b>${esc(label)}</b>.\n${headcountLine(week)}${invite}`,
+      text: sentPrivately
+        ? `➕ ${mention({ id: from.id, name: sponsor })} added <b>${esc(label)}</b>.\n${headcountLine(week)}`
+        : `➕ ${mention({ id: from.id, name: sponsor })} added <b>${esc(label)}</b>.\n${headcountLine(week)}${
+            link ? `\n\nShare this one-use link with them — it claims this spot:\n${link}` : ''
+          }\n<i>Tip: <a href="${dmOptInUrl()}">turn on personal updates</a> and I'll send these privately.</i>`,
       parse_mode: 'HTML',
     });
     return answer(`Added ${label}.`);
@@ -661,6 +839,7 @@ async function handleCallback(env, cb) {
         parse_mode: 'HTML',
       });
       await sendRecruitingAlert(env, chatConf.chatId, week, null);
+      await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
       return answer("You're out. The standby pool has been pinged.");
     }
     // 'in' taps on the final roster still work (claiming an open spot).
@@ -690,6 +869,7 @@ async function handleCallback(env, cb) {
       });
       await sendRecruitingAlert(env, chatConf.chatId, week, null);
     }
+    await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
     return answer("You're out. Thanks for the heads-up!");
   }
 
@@ -703,6 +883,21 @@ async function handleCommand(env, msg) {
   const chatId = msg.chat.id;
   const from = msg.from;
   const say = (t, extra = {}) => tg(env, 'sendMessage', { chat_id: chatId, text: t, parse_mode: 'HTML', ...extra });
+
+  // Opening the bot in a DM is the opt-in: record the private chat so we can
+  // message this person directly from now on.
+  if (cmd === '/start' && msg.chat.type === 'private') {
+    await kvPut(env, `dm:${from.id}`, { chatId, name: fullName(from) });
+    const buttons = [];
+    if (CONFIG.telegramInviteUrl) {
+      buttons.push([{ text: '👥 Join the group', url: CONFIG.telegramInviteUrl }]);
+    }
+    buttons.push([{ text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl }]);
+    return say(
+      `🔔 <b>You're set up for personal updates.</b>\nI'll message you here when a spot opens for you, when you're promoted onto a court, or when your guest claims their spot — instead of filling up the group chat.`,
+      { reply_markup: { inline_keyboard: buttons } }
+    );
+  }
 
   if (cmd === '/setup') {
     // Only group admins may bind the bot to a group.
@@ -746,6 +941,7 @@ async function handleCommand(env, msg) {
         await say(describeCascade(before, week, removed.map((r) => r.name)));
         await sendRecruitingAlert(env, chatId, week, null);
       }
+      await notifyPromotions(env, chatId, week, computePromotions(before, week));
     }
     return;
   }
@@ -773,6 +969,7 @@ async function handleCommand(env, msg) {
       await say(describeCascade(before, week, [name]));
       await sendRecruitingAlert(env, chatId, week, null);
     }
+    await notifyPromotions(env, chatId, week, computePromotions(before, week));
     return;
   }
 
@@ -896,11 +1093,39 @@ export default {
       const update = await request.json();
       try {
         if (update.callback_query) await handleCallback(env, update.callback_query);
+        else if (update.chat_member) await handleChatMember(env, update.chat_member);
         else if (update.message && update.message.text) await handleCommand(env, update.message);
       } catch (err) {
         console.log(`update error: ${err.stack || err.message}`);
       }
       return new Response('ok'); // always 200 so Telegram doesn't retry-loop
+    }
+
+    // --- Re-register the webhook and report bot permissions ---
+    // chat_member updates are NOT delivered unless explicitly requested, and
+    // minting invite links needs admin rights. GET /setup-webhook?key=SECRET
+    if (url.pathname === '/setup-webhook') {
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const hook = await tg(env, 'setWebhook', {
+        url: CONFIG.webhookUrl,
+        secret_token: env.WEBHOOK_SECRET,
+        allowed_updates: ['message', 'callback_query', 'chat_member'],
+      });
+      const me = await tg(env, 'getMe', {});
+      const chatConf = await kvGet(env, 'chat');
+      let rights = 'unknown (bot not bound to a group yet)';
+      if (chatConf && me.ok) {
+        const m = await tg(env, 'getChatMember', { chat_id: chatConf.chatId, user_id: me.result.id });
+        if (m.ok) {
+          rights = `status=${m.result.status}, can_invite_users=${m.result.can_invite_users}`;
+        }
+      }
+      return new Response(
+        `setWebhook: ${hook.ok ? 'ok' : hook.description}\nallowed_updates: message, callback_query, chat_member\nbot rights: ${rights}\n`,
+        { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } }
+      );
     }
 
     // --- Testing: manually fire a scheduled slot ---
@@ -1005,6 +1230,7 @@ export default {
               });
               await sendRecruitingAlert(env, chatConf.chatId, week, null);
             }
+            await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
           }
           if (['in', 'out', 'guest', 'dropguest'].includes(action)) {
             await saveWeek(env, week);
