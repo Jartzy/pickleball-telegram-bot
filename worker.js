@@ -405,15 +405,6 @@ function signupPageHtml(week, done, viewer = null) {
       }
       <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
     </form>`;
-  } else {
-    b += `<form method="POST" action="/signup" class="f">
-      <input name="name" placeholder="Your name" required maxlength="40" autocomplete="name"/>
-      <div class="btns">
-        <button name="action" value="in" class="in">${esc(joinLabel(week).replace('✅ ', ''))}</button>
-        <button name="action" value="out" class="out">❌ I'm out</button>
-      </div>
-      <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
-    </form>`;
   }
   // Someone inside the Mini App is already in Telegram — don't sell them on it.
   const joinStep = viewer
@@ -422,9 +413,14 @@ function signupPageHtml(week, done, viewer = null) {
     ? `<li>Join the group: <a href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">tap to join</a></li>`
     : `<li>Ask the group organizer for the invite link.</li>`;
   if (joinStep) {
+    const full = isFull(week);
     b += `<div class="tg">
-      <h2>📲 Get realtime updates</h2>
-      <p>Roll call, last-minute open spots, and roster changes post live in our Telegram group.</p>
+      <h2>${full ? '🚫 All courts are full this week' : '🏓 Want to play?'}</h2>
+      <p>${
+        full
+          ? `All ${CONFIG.game.courts} courts are booked. Join the group anyway — spots open up when people drop out.`
+          : 'Sign-ups, roll call and last-minute openings all happen in our Telegram group. Join and you can claim a spot in one tap.'
+      }</p>
       <p class="ctas">
         <a class="cta cta1" href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">👥 Join the group</a>
         <a class="cta cta2" href="${CONFIG.miniAppUrl || CONFIG.webUrl}" target="_blank" rel="noopener">🔔 Join &amp; get reminders</a>
@@ -1028,6 +1024,29 @@ async function handleCommand(env, msg) {
     return;
   }
 
+  // Organiser escape hatch: remove ANY roster entry by name. Covers guests,
+  // no-shows, and legacy web signups that nothing else can clear.
+  if (cmd === '/kick') {
+    const name = args.join(' ').trim();
+    if (!name) return say('Usage: /kick Name — removes anyone from this week\'s roster.');
+    const member = await tg(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
+    const status = member.ok ? member.result.status : 'unknown';
+    if (status !== 'creator' && status !== 'administrator') {
+      return say('Only a group admin can use /kick.');
+    }
+    const idx = week.players.findIndex((p) => p.name.toLowerCase() === name.toLowerCase());
+    if (idx === -1) return say(`No one named "${esc(name)}" on the roster.`);
+    const before = [...week.players];
+    const [gone] = week.players.splice(idx, 1);
+    // Their guests go too, mirroring a normal drop.
+    week.players = week.players.filter((p) => p.guestOf !== gone.id && p.guestOf !== gone.key);
+    await saveWeek(env, week);
+    await refreshRoster(env, chatId, week);
+    await say(describeCascade(before, week, [gone.name]));
+    await notifyPromotions(env, chatId, week, computePromotions(before, week));
+    return;
+  }
+
   if (cmd === '/guest') {
     const name = args.join(' ').trim();
     if (!name) return say('Usage: /guest FirstName — adds a guest under your name.');
@@ -1366,57 +1385,10 @@ export default {
           });
         }
 
-        let msg = '';
-        if (name) {
-          const key = `w:${name.toLowerCase()}`;
-          const idx = week.players.findIndex((p) => p.key === key);
-          if ((action === 'guest' || action === 'in') && isFull(week) && idx === -1) {
-            msg = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
-          } else if (action === 'guest') {
-            const label = nextGuestLabel(week, name);
-            week.players.push({
-              key: `wg:${name.toLowerCase()}:${label.toLowerCase()}`,
-              name: label,
-              guestOf: key, // sponsor's web key — drops together with them
-              guestOfName: name,
-            });
-            await saveWeek(env, week);
-            await refreshRoster(env, chatConf.chatId, week);
-            await announceWeb(env, chatConf.chatId, week, `➕ <b>${esc(name)}</b> added <b>${esc(label)}</b>.`);
-            msg = `Added ${label}.`;
-          } else if (action === 'in' && idx === -1) {
-            week.players.push({ key, name });
-            await saveWeek(env, week);
-            await refreshRoster(env, chatConf.chatId, week);
-            await announceWeb(env, chatConf.chatId, week, `✅ <b>${esc(name)}</b> is in (via the sign-up page).`);
-            msg = `You're in, ${name}!`;
-          } else if (action === 'out' && idx !== -1) {
-            // Take their guests with them, mirroring the Telegram cascade.
-            week.players = week.players.filter((p, i) => i !== idx && p.guestOf !== key);
-            await saveWeek(env, week);
-            await refreshRoster(env, chatConf.chatId, week);
-            await announceWeb(env, chatConf.chatId, week, `❌ <b>${esc(name)}</b> can no longer make it.`);
-            msg = `You're out, ${name}.`;
-          } else if (action === 'in') {
-            msg = `${name}, you're already on the list.`;
-          } else {
-            // action 'out' with no web-added match. If the name matches a
-            // Telegram member or a sponsored guest, it's protected — the web
-            // page can't drop it. Explain rather than say "not found".
-            const lower = name.toLowerCase();
-            const locked = week.players.find(
-              (p) => p.name.toLowerCase() === lower && (p.key.startsWith('u:') || p.key.startsWith('g:'))
-            );
-            if (locked && locked.guestOf) {
-              msg = `${name} is a guest — only the member who added them can remove them, in Telegram.`;
-            } else if (locked) {
-              msg = `${name} is in via Telegram — only they can drop themselves, in the group.`;
-            } else {
-              msg = `${name} wasn't found on the list.`;
-            }
-          }
-        }
-        return Response.redirect(`${url.origin}/signup?done=${encodeURIComponent(msg)}`, 303);
+        // Anonymous visitors can no longer mutate the roster: without a
+        // verified identity anyone could add or remove anyone. The page is a
+        // bridge into Telegram, where identity is real.
+        return Response.redirect(`${url.origin}/signup`, 303);
       }
 
       return new Response(signupPageHtml(week, url.searchParams.get('done') || ''), {
