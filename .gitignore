@@ -1,6 +1,10 @@
 node_modules/
 .wrangler/
 .dev.vars
+.DS_Store
+
+# Local dev helper for firing scheduled slots manually (takes the secret at runtime)
+test-slots.sh
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -40,7 +40,18 @@ const CONFIG = {
   playersPerCourt: 4,
 
   // The recurring game: Thursday 6:00 AM local time.
-  game: { weekday: 'Thu', hour: 6, label: '6:00 AM' },
+  game: {
+    weekday: 'Thu',
+    hour: 6,
+    label: '6:00 AM',
+    location: 'Bob Baskin Park',
+    mapUrl: 'https://www.google.com/maps/search/?api=1&query=Bob+Baskin+Park',
+  },
+
+  // Telegram group invite link — shown on the web sign-up page so people can
+  // join for realtime updates. Get it in Telegram: group → Manage → Invite
+  // Links. Leave '' to hide the "join the group" step.
+  telegramInviteUrl: 'https://t.me/+wOcsQEcWDuM2MDZh',
 
   // Automation moments, in local (Pacific) time. Each fires once per game
   // week (idempotent), matched within a 15-minute cron window.
@@ -225,6 +236,7 @@ function rosterText(week) {
   const lines = [];
 
   lines.push(`🏓 <b>Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</b>`);
+  lines.push(`📍 <a href="${CONFIG.game.mapUrl}">${CONFIG.game.location}</a>`);
   if (week.phase === 'final') lines.push('🔒 <b>FINAL ROSTER</b>');
   lines.push('');
 
@@ -258,13 +270,20 @@ function signupPageHtml(week, done) {
   let b = '';
   if (done) b += `<p class="msg">${esc(done)}</p>`;
   b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</h1>`;
+  b += `<p class="loc">📍 <a href="${CONFIG.game.mapUrl}" target="_blank" rel="noopener">${esc(CONFIG.game.location)}</a></p>`;
   if (courts.length === 0) b += `<p><i>Nobody signed up yet — be the first!</i></p>`;
   for (const c of courts) {
     b += c.isConfirmed
       ? `<h2>✅ Court ${c.courtNumber} (CONFIRMED)</h2>`
       : `<h2>⏳ Waitlist / Filling Court ${c.courtNumber}</h2>`;
     b += '<ol>';
-    for (const p of c.players) b += `<li>${displayName(p)}</li>`;
+    for (const p of c.players) {
+      // Telegram members are locked in (can't be dropped from the web) — badge
+      // them so web visitors see the perk of joining. Guests already read as
+      // "(guest of X)" via displayName.
+      const tag = p.key.startsWith('u:') ? ' <span class="tag">Telegram</span>' : '';
+      b += `<li>${displayName(p)}${tag}</li>`;
+    }
     b += '</ol>';
     if (!c.isConfirmed) {
       const n = c.playersNeeded;
@@ -278,6 +297,16 @@ function signupPageHtml(week, done) {
       <button name="action" value="in" class="in">✅ I'm in</button>
       <button name="action" value="out" class="out">❌ I'm out</button>
     </div></form>`;
+  const joinStep = CONFIG.telegramInviteUrl
+    ? `<li>Join the group: <a href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">tap to join</a></li>`
+    : `<li>Ask the group organizer for the invite link.</li>`;
+  b += `<div class="tg">
+    <h2>📲 Get realtime updates</h2>
+    <p>Roll call, last-minute open spots, and roster changes post live in our Telegram group.</p>
+    <ol>
+      <li>Install Telegram: <a href="https://telegram.org/apps" target="_blank" rel="noopener">telegram.org/apps</a></li>
+      ${joinStep}
+    </ol></div>`;
   return `<!doctype html><html><head><meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Pickleball Sign-Up</title><style>
@@ -291,6 +320,13 @@ function signupPageHtml(week, done) {
   .btns{display:flex;gap:10px;margin-top:10px}
   button{flex:1;padding:12px;font-size:1rem;border:0;border-radius:8px;color:#fff;cursor:pointer}
   .in{background:#16a34a}.out{background:#dc2626}
+  .loc{margin:2px 0 12px;font-size:.95rem}
+  .loc a,.tg a{color:#2563eb}
+  .tg{margin-top:24px;padding:14px 16px;background:#eff6ff;border-radius:10px}
+  .tg h2{font-size:1rem;margin:0 0 6px}
+  .tg p{margin:0 0 8px;font-size:.9rem}
+  .tg ol{margin:0;padding-left:20px}
+  .tag{display:inline-block;font-size:.7rem;color:#2563eb;background:#eff6ff;border-radius:6px;padding:1px 6px;vertical-align:middle}
   </style></head><body>${b}</body></html>`;
 }
 
@@ -736,7 +772,20 @@ export default {
           } else if (action === 'in') {
             msg = `${name}, you're already on the list.`;
           } else {
-            msg = `${name} wasn't found on the list.`;
+            // action 'out' with no web-added match. If the name matches a
+            // Telegram member or a sponsored guest, it's protected — the web
+            // page can't drop it. Explain rather than say "not found".
+            const lower = name.toLowerCase();
+            const locked = week.players.find(
+              (p) => p.name.toLowerCase() === lower && (p.key.startsWith('u:') || p.key.startsWith('g:'))
+            );
+            if (locked && locked.guestOf) {
+              msg = `${name} is a guest — only the member who added them can remove them, in Telegram.`;
+            } else if (locked) {
+              msg = `${name} is in via Telegram — only they can drop themselves, in the group.`;
+            } else {
+              msg = `${name} wasn't found on the list.`;
+            }
           }
         }
         return Response.redirect(`${url.origin}/signup?done=${encodeURIComponent(msg)}`, 303);
