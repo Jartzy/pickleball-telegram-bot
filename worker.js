@@ -734,7 +734,17 @@ async function handleChatMember(env, upd) {
 
   const week = await getWeek(env, rec.date);
   const idx = week.players.findIndex((p) => p.key === rec.key);
-  if (idx === -1) return; // placeholder already gone
+
+  // The spot they were invited to is gone (usually the sponsor dropped out).
+  // They're still in the group — welcome them and let them claim their own.
+  if (idx === -1) {
+    await dmUser(
+      env,
+      user.id,
+      `👋 Welcome! The spot you were invited to has since been given up, but you're in the group now.\n<b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)} — tap ✅ I'm in on the roster to take a spot.`
+    );
+    return;
+  }
 
   const chatConf = await kvGet(env, 'chat');
   if (!chatConf) return;
@@ -924,6 +934,36 @@ async function askSponsorsToConfirmGuests(env, week) {
   }
 }
 
+/**
+ * A sponsor's guests leave with them — the roster should never hold spots
+ * nobody owns. But the guests may still want to play, so hand their claim
+ * links back privately: those links still add them to the group, where they
+ * can take a spot in their own name.
+ */
+async function offerGuestLinksAfterDrop(env, sponsorId, removed) {
+  const guests = removed.filter((r) => r.guestOf === sponsorId);
+  if (!guests.length) return;
+
+  const lines = [
+    `👋 Your ${guests.length === 1 ? 'guest came' : `${guests.length} guests came`} off the roster with you.`,
+    '',
+  ];
+  const withLinks = guests.filter((g) => g.inviteLink);
+  if (withLinks.length) {
+    lines.push("If they'd still like to play, send them their own link — it adds them to the group so they can grab a spot themselves:");
+    for (const g of withLinks) lines.push(`• <b>${esc(g.name)}</b> — ${g.inviteLink}`);
+  }
+  const noLinks = guests.filter((g) => !g.inviteLink);
+  if (noLinks.length && CONFIG.telegramInviteUrl) {
+    lines.push(
+      `${withLinks.length ? '' : "If they'd still like to play, "}send ${noLinks
+        .map((g) => `<b>${esc(g.name)}</b>`)
+        .join(' and ')} the group link: ${CONFIG.telegramInviteUrl}`
+    );
+  }
+  await dmUser(env, sponsorId, lines.join('\n'), {}, 'guest');
+}
+
 /** Recruiting push: mention partial-court members + standby pool, add Claim button. */
 async function sendRecruitingAlert(env, chatId, week, intro) {
   const courts = groupPlayersIntoCourts(week.players);
@@ -1100,7 +1140,16 @@ async function handleCallback(env, cb) {
       return answer("You're not on the roster this week, so there's nothing to drop.", true);
     }
     await saveWeek(env, week);
-    await postChange(env, chatConf.chatId, week, `❌ <b>${esc(fullName(from))}</b> can no longer make it.\n${headcountLine(week)}`);
+    const alsoGuests = removed.length - 1;
+    await postChange(
+      env,
+      chatConf.chatId,
+      week,
+      `❌ <b>${esc(fullName(from))}</b> can no longer make it${
+        alsoGuests > 0 ? ` (and their ${alsoGuests} guest${alsoGuests === 1 ? '' : 's'})` : ''
+      }.\n${headcountLine(week)}`
+    );
+    await offerGuestLinksAfterDrop(env, from.id, removed);
     // Announce when a full court just broke, or any time after roll call.
     if (brokeAConfirmedCourt(before, week.players) || week.phase === 'rollcall' || week.phase === 'urgent') {
       await tg(env, 'sendMessage', {
@@ -1216,6 +1265,7 @@ async function handleCommand(env, msg) {
         await sendRecruitingAlert(env, chatId, week, null);
       }
       await notifyPromotions(env, chatId, week, computePromotions(before, week));
+      await offerGuestLinksAfterDrop(env, from.id, removed);
     }
     return;
   }
@@ -1584,6 +1634,7 @@ export default {
             const before = [...week.players];
             const removed = removeMember(week, tgUser.id);
             note = removed.length ? "You're out — thanks for the heads-up." : "You weren't on the roster.";
+            if (removed.length) await offerGuestLinksAfterDrop(env, tgUser.id, removed);
             // describeCascade already announces below when it fires.
             if (removed.length && week.phase === 'open' && !brokeAConfirmedCourt(before, week.players)) {
               announce = `❌ <b>${esc(who)}</b> can no longer make it.`;
