@@ -227,11 +227,6 @@ async function tg(env, method, params) {
   return data;
 }
 
-// Marker on the bot's guest prompt. Telegram delivers reply_to_message.text as
-// plain text, so we match the unformatted form (see handleCommand).
-const GUEST_PROMPT_PLAIN = '➕ Adding a guest';
-const GUEST_PROMPT = '➕ <b>Adding a guest</b>';
-
 function rosterKeyboard() {
   return {
     inline_keyboard: [
@@ -365,6 +360,7 @@ function signupPageHtml(week, done, viewer = null) {
           ? `<button name="action" value="out" class="out wide">❌ I can no longer go</button>`
           : `<button name="action" value="in" class="in wide">✅ I'm in</button>`
       }
+      <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
     </form>`;
   } else {
     b += `<form method="POST" action="/signup" class="f">
@@ -372,7 +368,9 @@ function signupPageHtml(week, done, viewer = null) {
       <div class="btns">
         <button name="action" value="in" class="in">✅ I'm in</button>
         <button name="action" value="out" class="out">❌ I'm out</button>
-      </div></form>`;
+      </div>
+      <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
+    </form>`;
   }
   // Someone inside the Mini App is already in Telegram — don't sell them on it.
   const joinStep = viewer
@@ -411,6 +409,7 @@ function signupPageHtml(week, done, viewer = null) {
   .tag{display:inline-block;font-size:.7rem;color:#2563eb;background:#eff6ff;border-radius:6px;padding:1px 6px;vertical-align:middle}
   .me{font-size:.8rem;color:#16a34a;font-weight:600}
   .wide{width:100%}
+  .guest{background:#334155;margin-top:10px}
   </style></head><body${viewer ? ' data-tg="1"' : ''}>${b}
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script>
@@ -477,6 +476,20 @@ function addMember(week, from) {
   if (findPlayer(week, key) !== -1) return false;
   week.players.push({ key, id: from.id, name: fullName(from) });
   return true;
+}
+
+/**
+ * Next free placeholder label for a sponsor: "John's guest", then
+ * "John's guest 2", ... Lets someone hold a spot in one tap, no typing.
+ */
+function nextGuestLabel(week, sponsorName) {
+  const base = `${sponsorName}'s guest`;
+  const taken = (label) => week.players.some((p) => p.name.toLowerCase() === label.toLowerCase());
+  if (!taken(base)) return base;
+  for (let i = 2; i <= 20; i++) {
+    if (!taken(`${base} ${i}`)) return `${base} ${i}`;
+  }
+  return `${base} 21`;
 }
 
 /** How many courts are currently full (4/4). */
@@ -572,15 +585,22 @@ async function handleCallback(env, cb) {
   const from = cb.from;
 
   if (cb.data === 'guest') {
-    // force_reply + selective aims the reply box at just this user, so adding
-    // a guest is a tap-and-type instead of remembering a command.
+    // One tap holds the spot under a placeholder name — no typing, no command.
+    const sponsor = fullName(from);
+    const label = nextGuestLabel(week, sponsor);
+    week.players.push({ key: `g:${from.id}:${label.toLowerCase()}`, name: label, guestOf: from.id, guestOfName: sponsor });
+    await saveWeek(env, week);
+    await refreshRoster(env, chatConf.chatId, week);
+
+    const invite = CONFIG.telegramInviteUrl
+      ? `\nIf they'd like to become a regular, send them this link: ${CONFIG.telegramInviteUrl}\nOnce they join they can tap ✅ I'm in, then free the placeholder with <code>/unguest ${esc(label)}</code>.`
+      : '';
     await tg(env, 'sendMessage', {
       chat_id: chatConf.chatId,
-      text: `${GUEST_PROMPT}\n${mention({ id: from.id, name: fullName(from) })} — reply to this message with their first name. They don't need Telegram. Remove them later with <code>/unguest Name</code>.`,
+      text: `➕ ${mention({ id: from.id, name: sponsor })} — I've added <b>${esc(label)}</b>.${invite}`,
       parse_mode: 'HTML',
-      reply_markup: { force_reply: true, selective: true },
     });
-    return answer('Reply with your guest\'s first name.');
+    return answer(`Added ${label}.`);
   }
 
   if (week.phase === 'final') {
@@ -639,28 +659,6 @@ async function handleCommand(env, msg) {
   const chatId = msg.chat.id;
   const from = msg.from;
   const say = (t, extra = {}) => tg(env, 'sendMessage', { chat_id: chatId, text: t, parse_mode: 'HTML', ...extra });
-
-  // Guest flow: a plain reply to the bot's "Adding a guest" prompt carries the
-  // guest's name, so nobody has to remember the /guest command.
-  const repliedTo = msg.reply_to_message;
-  if (
-    !text.startsWith('/') &&
-    repliedTo &&
-    repliedTo.from &&
-    repliedTo.from.is_bot &&
-    (repliedTo.text || '').startsWith(GUEST_PROMPT_PLAIN)
-  ) {
-    const conf = await kvGet(env, 'chat');
-    if (!conf || conf.chatId !== chatId) return;
-    const name = text.slice(0, 40).trim();
-    if (!name) return say('No name given — tap ➕ Bring a guest to try again.');
-    const week = await getWeek(env, activeGameDate(new Date()));
-    const key = `g:${from.id}:${name.toLowerCase()}`;
-    if (findPlayer(week, key) !== -1) return say(`${esc(name)} is already on the roster.`);
-    week.players.push({ key, name, guestOf: from.id, guestOfName: fullName(from) });
-    await saveWeek(env, week);
-    return refreshRoster(env, chatId, week);
-  }
 
   if (cmd === '/setup') {
     // Only group admins may bind the bot to a group.
@@ -920,7 +918,17 @@ export default {
             username: tgUser.username,
           };
           let note = '';
-          if (action === 'in') {
+          if (action === 'guest') {
+            const sponsor = fullName(from);
+            const label = nextGuestLabel(week, sponsor);
+            week.players.push({
+              key: `g:${tgUser.id}:${label.toLowerCase()}`,
+              name: label,
+              guestOf: tgUser.id,
+              guestOfName: sponsor,
+            });
+            note = `Added ${label}.`;
+          } else if (action === 'in') {
             note = addMember(week, from) ? "You're in!" : "You're already on the roster.";
           } else if (action === 'out') {
             const before = [...week.players];
@@ -935,7 +943,7 @@ export default {
               await sendRecruitingAlert(env, chatConf.chatId, week, null);
             }
           }
-          if (action === 'in' || action === 'out') {
+          if (action === 'in' || action === 'out' || action === 'guest') {
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
           }
@@ -948,13 +956,25 @@ export default {
         if (name) {
           const key = `w:${name.toLowerCase()}`;
           const idx = week.players.findIndex((p) => p.key === key);
-          if (action === 'in' && idx === -1) {
+          if (action === 'guest') {
+            const label = nextGuestLabel(week, name);
+            week.players.push({
+              key: `wg:${name.toLowerCase()}:${label.toLowerCase()}`,
+              name: label,
+              guestOf: key, // sponsor's web key — drops together with them
+              guestOfName: name,
+            });
+            await saveWeek(env, week);
+            await refreshRoster(env, chatConf.chatId, week);
+            msg = `Added ${label}.`;
+          } else if (action === 'in' && idx === -1) {
             week.players.push({ key, name });
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
             msg = `You're in, ${name}!`;
           } else if (action === 'out' && idx !== -1) {
-            week.players.splice(idx, 1);
+            // Take their guests with them, mirroring the Telegram cascade.
+            week.players = week.players.filter((p, i) => i !== idx && p.guestOf !== key);
             await saveWeek(env, week);
             await refreshRoster(env, chatConf.chatId, week);
             msg = `You're out, ${name}.`;
