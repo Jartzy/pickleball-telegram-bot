@@ -370,9 +370,9 @@ function signupPageHtml(week, done, viewer = null) {
       // a shared Telegram group message can never show.
       const me = viewer && p.key === `u:${viewer.id}` ? ' <span class="me">(me)</span>' : '';
       // A sponsor can drop each of their own guests individually.
-      const mine = viewer && p.guestOf === viewer.id;
+      const mine = viewer && (p.guestOf === viewer.id || (viewer.isAdmin && p.key !== `u:${viewer.id}`));
       const drop = mine
-        ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove this guest">✕</button></form>`
+        ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove">✕</button></form>`
         : '';
       b += `<li>${displayName(p)}${tag}${me}${drop}</li>`;
     }
@@ -381,6 +381,9 @@ function signupPageHtml(week, done, viewer = null) {
       const n = c.playersNeeded;
       b += `<p class="need">Needs ${n} more player${n === 1 ? '' : 's'} to unlock this court</p>`;
     }
+  }
+  if (viewer && viewer.isAdmin) {
+    b += `<p class="adminbar">🛠 <b>Admin controls</b> — only you can see these. The ✕ next to a name removes them (and any guests they brought).</p>`;
   }
   b += `<p>👥 ${week.players.length} signed up</p>`;
   // After adding a guest, surface the message to forward to them.
@@ -423,7 +426,7 @@ function signupPageHtml(week, done, viewer = null) {
       }</p>
       <p class="ctas">
         <a class="cta cta1" href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">👥 Join the group</a>
-        <a class="cta cta2" href="${CONFIG.miniAppUrl || CONFIG.webUrl}" target="_blank" rel="noopener">🔔 Join &amp; get reminders</a>
+        <a class="cta cta2" href="${dmOptInUrl()}" target="_blank" rel="noopener">🔔 Get reminders from the bot</a>
       </p>
       <p class="fine">New to Telegram? <a href="https://telegram.org/apps" target="_blank" rel="noopener">Install it here</a> first — it's free.</p>
       </div>`;
@@ -453,6 +456,7 @@ function signupPageHtml(week, done, viewer = null) {
   .guest{background:#334155;margin-top:10px}
   .x{display:inline;margin-left:6px}
   .xbtn{background:#e2e8f0;color:#b91c1c;border:0;border-radius:6px;padding:1px 7px;font-size:.8rem;cursor:pointer;width:auto;flex:none}
+  .adminbar{background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:8px 10px;font-size:.82rem;margin:10px 0}
   .share{margin-top:20px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
   .share h2{font-size:1rem;margin:0 0 6px}
   .share p{margin:0 0 8px;font-size:.9rem}
@@ -611,6 +615,16 @@ async function notifyPlayer(env, groupChatId, user, text, extra = {}) {
 // which link a joiner used (ChatMemberUpdated.invite_link), so one tap both
 // joins the group and claims the spot — no tokens for anyone to paste.
 // ---------------------------------------------------------------------------
+
+async function liveGroupId(env, fallback) {
+  const live = await kvGet(env, 'chat:live');
+  return live ? live.chatId : fallback;
+}
+
+async function isGroupAdmin(env, groupId, userId) {
+  const m = await tg(env, 'getChatMember', { chat_id: groupId, user_id: userId });
+  return m.ok && ['creator', 'administrator'].includes(m.result.status);
+}
 
 async function mintGuestInvite(env, chatId, week, player) {
   // In test mode `chat` points at a DM, and you cannot mint an invite link for
@@ -1032,7 +1046,10 @@ async function handleCommand(env, msg) {
     const member = await tg(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
     const status = member.ok ? member.result.status : 'unknown';
     if (status !== 'creator' && status !== 'administrator') {
-      return say('Only a group admin can use /kick.');
+      return say(
+        `Only a group admin can use /kick. Telegram reports your status here as <b>${esc(status)}</b>` +
+          (member.ok ? '.' : ` (lookup failed: ${esc(member.description || 'unknown error')}).`)
+      );
     }
     const idx = week.players.findIndex((p) => p.name.toLowerCase() === name.toLowerCase());
     if (idx === -1) return say(`No one named "${esc(name)}" on the roster.`);
@@ -1311,7 +1328,8 @@ export default {
           if (!tgUser) {
             return new Response('Could not verify your Telegram session.', { status: 403 });
           }
-          const viewer = { id: tgUser.id, initData };
+          const groupId = await liveGroupId(env, chatConf.chatId);
+          const viewer = { id: tgUser.id, initData, isAdmin: await isGroupAdmin(env, groupId, tgUser.id) };
           const from = {
             id: tgUser.id,
             first_name: tgUser.first_name,
@@ -1338,13 +1356,19 @@ export default {
           } else if (action === 'dropguest') {
             // Only the sponsor may remove their own guest.
             const gk = (form.get('guestKey') || '').toString();
-            const gi = week.players.findIndex((p) => p.key === gk && p.guestOf === tgUser.id);
+            const gi = week.players.findIndex(
+              (p) => p.key === gk && (p.guestOf === tgUser.id || (viewer.isAdmin && p.key !== `u:${tgUser.id}`))
+            );
             if (gi === -1) {
-              note = 'That guest is no longer on the list.';
+              note = 'That person is no longer on the list (or is not yours to remove).';
             } else {
+              const beforeDrop = [...week.players];
               const [gone] = week.players.splice(gi, 1);
+              // Anyone they sponsored leaves with them.
+              week.players = week.players.filter((p) => p.guestOf !== gone.id && p.guestOf !== gone.key);
               note = `Removed ${gone.name}.`;
               announce = `➖ <b>${esc(who)}</b> removed <b>${esc(gone.name)}</b>.`;
+              await notifyPromotions(env, chatConf.chatId, week, computePromotions(beforeDrop, week));
             }
           } else if (action === 'in') {
             const added = addMember(week, from);
