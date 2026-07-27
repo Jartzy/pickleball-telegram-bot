@@ -1093,7 +1093,15 @@ export default {
       const update = await request.json();
       try {
         if (update.callback_query) await handleCallback(env, update.callback_query);
-        else if (update.chat_member) await handleChatMember(env, update.chat_member);
+        // A group upgraded to a supergroup gets a NEW chat id. Re-bind, or every
+        // later post goes to the dead chat and permission checks read stale.
+        else if (update.message && update.message.migrate_to_chat_id) {
+          await kvPut(env, 'chat', { chatId: update.message.migrate_to_chat_id });
+          const week = await getWeek(env, activeGameDate(new Date()));
+          week.msgId = null; // old message lives in the old chat
+          await saveWeek(env, week);
+          await refreshRoster(env, update.message.migrate_to_chat_id, week, { repost: true });
+        } else if (update.chat_member) await handleChatMember(env, update.chat_member);
         else if (update.message && update.message.text) await handleCommand(env, update.message);
       } catch (err) {
         console.log(`update error: ${err.stack || err.message}`);
@@ -1105,7 +1113,10 @@ export default {
     // chat_member updates are NOT delivered unless explicitly requested, and
     // minting invite links needs admin rights. GET /setup-webhook?key=SECRET
     if (url.pathname === '/setup-webhook') {
-      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET) {
+        return new Response('WEBHOOK_SECRET is not set on the Worker', { status: 503 });
+      }
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const hook = await tg(env, 'setWebhook', {
@@ -1144,7 +1155,10 @@ export default {
     // --- Testing: manually fire a scheduled slot ---
     // GET /run?slot=rollcall&key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/run') {
-      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET) {
+        return new Response('WEBHOOK_SECRET is not set on the Worker', { status: 503 });
+      }
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const slot = url.searchParams.get('slot');
@@ -1159,7 +1173,10 @@ export default {
     // --- Testing: wipe the current week's roster ---
     // GET /reset?key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/reset') {
-      if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+      if (!env.WEBHOOK_SECRET) {
+        return new Response('WEBHOOK_SECRET is not set on the Worker', { status: 503 });
+      }
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
       const date = activeGameDate(new Date());
