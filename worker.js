@@ -53,6 +53,13 @@ const CONFIG = {
   // Links. Leave '' to hide the "join the group" step.
   telegramInviteUrl: 'https://t.me/+wOcsQEcWDuM2MDZh',
 
+  // Public sign-up page, linked from the roster message. Set miniAppUrl to a
+  // BotFather Direct Link Mini App (https://t.me/<bot>/<app>) to make the
+  // button open *inside* Telegram — that path also passes a signed initData,
+  // which unlocks the personalised "(me)" view. Falls back to webUrl.
+  webUrl: 'https://pickleball-bot.jmartin84.workers.dev/signup',
+  miniAppUrl: '',
+
   // Automation moments, in local (Pacific) time. Each fires once per game
   // week (idempotent), matched within a 15-minute cron window.
   slots: [
@@ -233,6 +240,7 @@ function rosterKeyboard() {
         { text: "❌ I can't make it", callback_data: 'out' },
       ],
       [{ text: '➕ Bring a guest', callback_data: 'guest' }],
+      [{ text: '🌐 Sign-up page', url: CONFIG.miniAppUrl || CONFIG.webUrl }],
     ],
   };
 }
@@ -275,7 +283,49 @@ function rosterText(week) {
   return lines.join('\n');
 }
 
-function signupPageHtml(week, done) {
+/**
+ * Verifies Telegram Mini App initData and returns the user, or null.
+ *
+ * Per Telegram: secret_key = HMAC_SHA256(bot_token, key="WebAppData"), then the
+ * signature is HMAC_SHA256(data_check_string, key=secret_key). Never trust the
+ * `user` field without this check — it's attacker-supplied otherwise.
+ */
+async function verifyInitData(env, initData) {
+  if (!initData || !env.TELEGRAM_BOT_TOKEN) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+
+  const checkString = [...params.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+
+  const enc = new TextEncoder();
+  const hmac = async (keyBytes, msg) => {
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(msg)));
+  };
+
+  const secret = await hmac(enc.encode('WebAppData'), env.TELEGRAM_BOT_TOKEN);
+  const sig = await hmac(secret, checkString);
+  const hex = [...sig].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (hex !== hash) return null;
+
+  // Reject stale payloads (replay protection).
+  const authDate = Number(params.get('auth_date') || 0);
+  if (!authDate || Date.now() / 1000 - authDate > 86400) return null;
+
+  try {
+    const user = JSON.parse(params.get('user') || 'null');
+    return user && user.id ? user : null;
+  } catch {
+    return null;
+  }
+}
+
+function signupPageHtml(week, done, viewer = null) {
   const courts = groupPlayersIntoCourts(week.players);
   let b = '';
   if (done) b += `<p class="msg">${esc(done)}</p>`;
@@ -292,7 +342,10 @@ function signupPageHtml(week, done) {
       // them so web visitors see the perk of joining. Guests already read as
       // "(guest of X)" via displayName.
       const tag = p.key.startsWith('u:') ? ' <span class="tag">Telegram</span>' : '';
-      b += `<li>${displayName(p)}${tag}</li>`;
+      // Only a verified Mini App viewer can be identified — this is the "(me)"
+      // a shared Telegram group message can never show.
+      const me = viewer && p.key === `u:${viewer.id}` ? ' <span class="me">(me)</span>' : '';
+      b += `<li>${displayName(p)}${tag}${me}</li>`;
     }
     b += '</ol>';
     if (!c.isConfirmed) {
@@ -301,22 +354,41 @@ function signupPageHtml(week, done) {
     }
   }
   b += `<p>👥 ${week.players.length} signed up</p>`;
-  b += `<form method="POST" action="/signup" class="f">
-    <input name="name" placeholder="Your name" required maxlength="40" autocomplete="name"/>
-    <div class="btns">
-      <button name="action" value="in" class="in">✅ I'm in</button>
-      <button name="action" value="out" class="out">❌ I'm out</button>
-    </div></form>`;
-  const joinStep = CONFIG.telegramInviteUrl
+  if (viewer) {
+    // Identity is proven by initData, so no name box — and the action is
+    // contextual to whether this person is already on the roster.
+    const onRoster = week.players.some((p) => p.key === `u:${viewer.id}`);
+    b += `<form method="POST" action="/signup" class="f">
+      <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
+      ${
+        onRoster
+          ? `<button name="action" value="out" class="out wide">❌ I can no longer go</button>`
+          : `<button name="action" value="in" class="in wide">✅ I'm in</button>`
+      }
+    </form>`;
+  } else {
+    b += `<form method="POST" action="/signup" class="f">
+      <input name="name" placeholder="Your name" required maxlength="40" autocomplete="name"/>
+      <div class="btns">
+        <button name="action" value="in" class="in">✅ I'm in</button>
+        <button name="action" value="out" class="out">❌ I'm out</button>
+      </div></form>`;
+  }
+  // Someone inside the Mini App is already in Telegram — don't sell them on it.
+  const joinStep = viewer
+    ? null
+    : CONFIG.telegramInviteUrl
     ? `<li>Join the group: <a href="${CONFIG.telegramInviteUrl}" target="_blank" rel="noopener">tap to join</a></li>`
     : `<li>Ask the group organizer for the invite link.</li>`;
-  b += `<div class="tg">
-    <h2>📲 Get realtime updates</h2>
-    <p>Roll call, last-minute open spots, and roster changes post live in our Telegram group.</p>
-    <ol>
-      <li>Install Telegram: <a href="https://telegram.org/apps" target="_blank" rel="noopener">telegram.org/apps</a></li>
-      ${joinStep}
-    </ol></div>`;
+  if (joinStep) {
+    b += `<div class="tg">
+      <h2>📲 Get realtime updates</h2>
+      <p>Roll call, last-minute open spots, and roster changes post live in our Telegram group.</p>
+      <ol>
+        <li>Install Telegram: <a href="https://telegram.org/apps" target="_blank" rel="noopener">telegram.org/apps</a></li>
+        ${joinStep}
+      </ol></div>`;
+  }
   return `<!doctype html><html><head><meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Pickleball Sign-Up</title><style>
@@ -337,7 +409,29 @@ function signupPageHtml(week, done) {
   .tg p{margin:0 0 8px;font-size:.9rem}
   .tg ol{margin:0;padding-left:20px}
   .tag{display:inline-block;font-size:.7rem;color:#2563eb;background:#eff6ff;border-radius:6px;padding:1px 6px;vertical-align:middle}
-  </style></head><body>${b}</body></html>`;
+  .me{font-size:.8rem;color:#16a34a;font-weight:600}
+  .wide{width:100%}
+  </style></head><body${viewer ? ' data-tg="1"' : ''}>${b}
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+  (function () {
+    var w = window.Telegram && window.Telegram.WebApp;
+    if (!w) return;                       // plain browser — anonymous view
+    w.ready(); w.expand();
+    // Already personalised (server verified us), nothing more to do.
+    if (document.body.dataset.tg) return;
+    if (!w.initData) return;              // opened outside Telegram
+    var f = document.createElement('form');
+    f.method = 'POST'; f.action = '/signup';
+    [['initData', w.initData], ['action', 'view']].forEach(function (kv) {
+      var i = document.createElement('input');
+      i.type = 'hidden'; i.name = kv[0]; i.value = kv[1];
+      f.appendChild(i);
+    });
+    document.body.appendChild(f); f.submit();
+  })();
+  </script>
+  </body></html>`;
 }
 
 /** Edits the live roster message in place; falls back to posting a new one. */
@@ -809,6 +903,47 @@ export default {
         const form = await request.formData();
         const name = (form.get('name') || '').toString().trim().slice(0, 40);
         const action = (form.get('action') || '').toString();
+        const initData = (form.get('initData') || '').toString();
+
+        // Mini App path: identity is cryptographically proven, so act as the
+        // real Telegram user (u:<id>) instead of an unauthenticated w:<name>.
+        if (initData) {
+          const tgUser = await verifyInitData(env, initData);
+          if (!tgUser) {
+            return new Response('Could not verify your Telegram session.', { status: 403 });
+          }
+          const viewer = { id: tgUser.id, initData };
+          const from = {
+            id: tgUser.id,
+            first_name: tgUser.first_name,
+            last_name: tgUser.last_name,
+            username: tgUser.username,
+          };
+          let note = '';
+          if (action === 'in') {
+            note = addMember(week, from) ? "You're in!" : "You're already on the roster.";
+          } else if (action === 'out') {
+            const before = [...week.players];
+            const removed = removeMember(week, tgUser.id);
+            note = removed.length ? "You're out — thanks for the heads-up." : "You weren't on the roster.";
+            if (removed.length && (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players))) {
+              await tg(env, 'sendMessage', {
+                chat_id: chatConf.chatId,
+                text: describeCascade(before, week, removed.map((r) => r.name)),
+                parse_mode: 'HTML',
+              });
+              await sendRecruitingAlert(env, chatConf.chatId, week, null);
+            }
+          }
+          if (action === 'in' || action === 'out') {
+            await saveWeek(env, week);
+            await refreshRoster(env, chatConf.chatId, week);
+          }
+          return new Response(signupPageHtml(week, note, viewer), {
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+          });
+        }
+
         let msg = '';
         if (name) {
           const key = `w:${name.toLowerCase()}`;
