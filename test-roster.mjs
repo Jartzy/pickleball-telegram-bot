@@ -4,7 +4,7 @@
 import {
   groupPlayersIntoCourts, rosterText, describeCascade, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome,
-  headcountLine, nextOccurrence, eventId, newEvent,
+  headcountLine, nextOccurrence, eventId, newEvent, parsePropose, ensurePids,
 } from './worker.js';
 
 const SIZE = 4;
@@ -185,6 +185,54 @@ console.log('\n== event identity ==');
   // KV keys sort chronologically because the id starts with the date.
   const a = eventId('2026-08-06', 6, 'r'), b = eventId('2026-08-09', 9, 'ab12');
   check('event ids sort by date', a < b);
+}
+
+console.log('\n== proposals: parsePropose ==');
+{
+  const now = new Date('2026-08-02T17:00:00Z'); // Sun 10am PDT
+  const sat = parsePropose('Sat 9am', now);
+  check('weekday resolves forward', sat && sat.date === '2026-08-08' && sat.hour === 9, JSON.stringify(sat));
+  check('label normalized', sat.label === '9:00 AM', sat.label);
+  const pm = parsePropose('Tue 6:30 PM', now);
+  check('pm + minutes', pm && pm.hour === 18 && pm.label === '6:30 PM', JSON.stringify(pm));
+  const iso = parsePropose('2026-08-20 7am', now);
+  check('ISO date accepted', iso && iso.date === '2026-08-20' && iso.hour === 7);
+  const slash = parsePropose('8/15 6am', now);
+  check('M/D accepted', slash && slash.date === '2026-08-15');
+  check('same weekday today counts as today', parsePropose('Sun 5pm', now).date === '2026-08-02');
+  check('garbage rejected', parsePropose('whenever ish', now) === null);
+  check('missing time rejected', parsePropose('Sat', now) === null);
+}
+
+console.log('\n== callback_data stays under 64 bytes ==');
+{
+  // Worst case: gc:<eventId>:<pid> with a proposal id.
+  const eid = eventId('2026-12-31', 23, 'zzzz');
+  const cb = `gc:${eid}:abcd`;
+  check('guest-cancel callback fits', new TextEncoder().encode(cb).length <= 64, `${cb.length} chars`);
+  const inCb = `in:${eid}`;
+  check('join callback fits', new TextEncoder().encode(inCb).length <= 64);
+}
+
+console.log('\n== pid backfill ==');
+{
+  const e = ev(3);
+  delete e.players[0].pid;
+  e.players[1].pid = e.players[2].pid = 'dupe';
+  ensurePids(e);
+  const pids = e.players.map((p) => p.pid);
+  check('all players have pids', pids.every(Boolean));
+  check('pids unique', new Set(pids).size === pids.length, JSON.stringify(pids));
+}
+
+console.log('\n== proposed event shape ==');
+{
+  const g = { chatId: -5, settings: { location: 'Bob Baskin Park', mapUrl: 'u', courts: 4, perCourt: 4 } };
+  const e = newEvent(g, { date: '2026-08-08', hour: 9, label: '9:00 AM', sfx: 'ab12', kind: 'proposed',
+    proposedBy: 7, proposedByName: 'John', location: 'Fiesta', perCourt: 2 });
+  check('overrides beat group defaults', e.location === 'Fiesta' && e.perCourt === 2);
+  check('roster credits proposer', rosterText(e).includes('proposed by John'));
+  check('recurring roster has no proposer line', !rosterText(ev(2)).includes('proposed by'));
 }
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURES'}\n`);

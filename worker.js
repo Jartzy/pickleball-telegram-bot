@@ -351,6 +351,25 @@ function eventId(date, hour, sfx) {
   return `${date}T${String(hour).padStart(2, '0')}:${sfx}`;
 }
 
+function shortId(len = 4) {
+  let out = '';
+  while (out.length < len) out += Math.random().toString(36).slice(2);
+  return out.slice(0, len);
+}
+
+/**
+ * Guest keys can be 40+ chars, far too long for callback_data once an event
+ * id rides along (Telegram caps it at 64 bytes). Every player gets a 4-char
+ * pid used in buttons instead; older records are backfilled here.
+ */
+function ensurePids(event) {
+  const seen = new Set();
+  for (const pl of event.players) {
+    if (!pl.pid || seen.has(pl.pid)) pl.pid = shortId();
+    seen.add(pl.pid);
+  }
+}
+
 async function getEvent(env, chatId, id) {
   return kvGet(env, `event:${chatId}:${id}`);
 }
@@ -430,6 +449,44 @@ async function materializeRecurring(env, group, now = new Date()) {
 }
 
 /**
+ * "/propose Sat 9am" (or "8/15 6:30 PM", "2026-08-20 7am") -> {date, hour,
+ * label}. Weekday names resolve to the NEXT such day (up to a week out).
+ */
+function parsePropose(argText, now = new Date()) {
+  const m = argText.trim().match(/^(\S+)\s+(.+)$/);
+  if (!m) return null;
+  const [_, dayRaw, timeRaw] = m;
+
+  let date = null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dayRaw)) {
+    date = dayRaw;
+  } else if (/^\d{1,2}\/\d{1,2}$/.test(dayRaw)) {
+    const [mo, d] = dayRaw.split('/').map(Number);
+    const yr = Number(localParts(now).y);
+    const candidate = `${yr}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    date = candidate >= localDateStr(now) ? candidate : `${yr + 1}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  } else {
+    const want = dayRaw.slice(0, 1).toUpperCase() + dayRaw.slice(1, 3).toLowerCase();
+    for (let i = 0; i <= 7; i++) {
+      const cand = new Date(now.getTime() + i * 86400000);
+      if (localParts(cand).wd === want) {
+        date = localDateStr(cand);
+        break;
+      }
+    }
+  }
+  if (!date) return null;
+
+  const hour = parseHour(timeRaw);
+  if (hour === null) return null;
+  // Normalized display label, e.g. "9:00 AM".
+  const mins = (timeRaw.match(/:(\d{2})/) || [])[1] || '00';
+  const h12 = hour % 12 === 0 ? 12 : hour % 12;
+  const label = `${h12}:${mins} ${hour < 12 ? 'AM' : 'PM'}`;
+  return { date, hour, label };
+}
+
+/**
  * Pushes changed group settings onto the upcoming recurring event. A changed
  * hour changes the event id (the id embeds it), so the record is re-keyed
  * with players and roster message preserved. Proposals keep their own fields.
@@ -501,15 +558,18 @@ function joinLabel(week) {
 }
 
 function rosterKeyboard(week) {
-  return {
-    inline_keyboard: [
-      [{ text: week ? joinLabel(week) : "✅ I'm in", callback_data: 'in' }],
-      [
-        { text: "❌ Can't make it", callback_data: 'out' },
-        { text: '➕ Bring a guest', callback_data: 'guest' },
-      ],
+  const t = week && week.id ? `:${week.id}` : '';
+  const rows = [
+    [{ text: week ? joinLabel(week) : "✅ I'm in", callback_data: `in${t}` }],
+    [
+      { text: "❌ Can't make it", callback_data: `out${t}` },
+      { text: '➕ Bring a guest', callback_data: `guest${t}` },
     ],
-  };
+  ];
+  if (week && week.kind === 'proposed' && week.id) {
+    rows.push([{ text: '🗑 Cancel this game', callback_data: `xg:${week.id}` }]);
+  }
+  return { inline_keyboard: rows };
 }
 
 // ============================================================================
@@ -522,6 +582,9 @@ function rosterText(week) {
 
   lines.push(`🏓 <b>Pickleball — ${fmtGameDate(week.date)}, ${week.label}</b>`);
   lines.push(`📍 <a href="${week.mapUrl}">${week.location}</a> · ${week.courts} courts`);
+  if (week.kind === 'proposed' && week.proposedByName) {
+    lines.push(`💡 <i>Pickup game proposed by ${esc(week.proposedByName)}</i>`);
+  }
   if (week.phase === 'final') lines.push('🔒 <b>FINAL ROSTER</b>');
   lines.push('');
 
@@ -799,9 +862,11 @@ async function refreshRoster(env, chatId, week, { repost = false } = {}) {
     if (prevMsgId && prevMsgId !== week.msgId) {
       await tg(env, 'unpinChatMessage', { chat_id: chatId, message_id: prevMsgId });
     }
-    // Pinning keeps the live roster easy to find; ignore failure if the bot
-    // isn't an admin.
-    await tg(env, 'pinChatMessage', { chat_id: chatId, message_id: week.msgId, disable_notification: true });
+    // Pin the recurring roster only — a busy week of proposals shouldn't
+    // fight over the single pinned slot. Failure is fine (bot not admin).
+    if (week.kind !== 'proposed') {
+      await tg(env, 'pinChatMessage', { chat_id: chatId, message_id: week.msgId, disable_notification: true });
+    }
   }
 }
 
@@ -816,7 +881,7 @@ function findPlayer(week, key) {
 function addMember(week, from) {
   const key = `u:${from.id}`;
   if (findPlayer(week, key) !== -1) return false;
-  week.players.push({ key, id: from.id, name: fullName(from) });
+  week.players.push({ key, pid: shortId(), id: from.id, name: fullName(from) });
   return true;
 }
 
@@ -1178,6 +1243,7 @@ function describeCascade(beforePlayers, week, removedNames) {
  * rather than discovered on the morning.
  */
 async function askSponsorsToConfirmGuests(env, week) {
+  ensurePids(week);
   const bySponsor = new Map();
   for (const p of week.players) {
     if (!p.guestOf) continue;
@@ -1187,7 +1253,7 @@ async function askSponsorsToConfirmGuests(env, week) {
 
   for (const [sponsorId, guests] of bySponsor) {
     const rows = guests.map((g) => [
-      { text: `❌ ${g.name} can't make it`, callback_data: `gcancel:${g.key}` },
+      { text: `❌ ${g.name} can't make it`, callback_data: `gc:${week.id}:${g.pid}` },
     ]);
     rows.unshift([{ text: `✅ All still coming`, callback_data: 'gconfirm' }]);
     if (guests.length > 1) rows.push([{ text: '❌ Cancel all my guests', callback_data: 'gcancelall' }]);
@@ -1259,7 +1325,7 @@ async function sendRecruitingAlert(env, chatId, week, intro) {
     chat_id: chatId,
     text: lines.join('\n'),
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🖐 Claim a spot', callback_data: 'in' }]] },
+    reply_markup: { inline_keyboard: [[{ text: '🖐 Claim a spot', callback_data: `in:${week.id}` }]] },
   });
 }
 
@@ -1323,21 +1389,41 @@ async function handleCallback(env, cb) {
   let group = await resolveGroupForChat(env, cbChatId);
   if (!group) group = await defaultGroup(env);
   if (!group) return answer('Bot not set up yet — an admin must run /setup in the group.');
+  await rememberMembership(env, from.id, group.chatId);
 
-  const week = await soonestEvent(env, group);
-  if (!week) return answer('No upcoming game to act on.');
+  // Buttons are event-scoped: "<action>:<eventId>". Bare actions (legacy
+  // messages, recruiting alerts) fall back to the soonest upcoming event.
+  const sep = cb.data.indexOf(':');
+  const action = sep === -1 ? cb.data : cb.data.slice(0, sep);
+  let eid = sep === -1 ? '' : cb.data.slice(sep + 1);
+  let gcPid = '';
+  if (action === 'gc') {
+    const cut = eid.lastIndexOf(':');
+    gcPid = eid.slice(cut + 1);
+    eid = eid.slice(0, cut);
+  }
+
+  let week = eid ? await getEvent(env, group.chatId, eid) : await soonestEvent(env, group);
+  if (week && (week.status !== 'active' || week.phase === 'done')) {
+    return answer('That game is over — check the roster for the next one.', true);
+  }
+  if (!week) {
+    if (eid) return answer('That game is no longer on.', true);
+    return answer('No upcoming game to act on.');
+  }
+  ensurePids(week);
   const chatConf = { chatId: sendTarget(group) };
+  cb.data = action; // handlers below switch on the bare action
 
   if (cb.data === 'gconfirm') {
     return answer('Great — nothing changed. Thanks for confirming!', true);
   }
 
-  if (cb.data === 'gcancel' || cb.data === 'gcancelall' || cb.data.startsWith('gcancel:')) {
+  if (cb.data === 'gc' || cb.data === 'gcancel' || cb.data === 'gcancelall') {
     const all = cb.data === 'gcancelall';
-    const key = all ? null : cb.data.slice('gcancel:'.length);
     const before = [...week.players];
     const doomed = week.players.filter((p) =>
-      all ? p.guestOf === from.id : p.key === key && p.guestOf === from.id
+      all ? p.guestOf === from.id : p.pid === gcPid && p.guestOf === from.id
     );
     if (doomed.length === 0) return answer('That guest is already off the roster.', true);
     week.players = week.players.filter((p) => !doomed.includes(p));
@@ -1354,6 +1440,28 @@ async function handleCallback(env, cb) {
     return answer(`Removed ${names.join(', ')}. Thanks for the heads-up!`, true);
   }
 
+  if (cb.data === 'xg') {
+    const allowed = week.proposedBy === from.id || (await isGroupAdmin(env, group.chatId, from.id));
+    if (!allowed) return answer('Only the proposer or a group admin can cancel this game.', true);
+    week.status = 'cancelled';
+    await saveEvent(env, week);
+    if (week.msgId) {
+      await tg(env, 'editMessageText', {
+        chat_id: chatConf.chatId,
+        message_id: week.msgId,
+        text: `🗑 <b>${fmtGameDate(week.date)}, ${week.label}</b> at ${esc(week.location)} — cancelled by ${esc(fullName(from))}.`,
+        parse_mode: 'HTML',
+      });
+    }
+    for (const pl of week.players) {
+      const targetId = pl.id || pl.guestOf;
+      if (!targetId || targetId === from.id) continue;
+      await notifyPlayer(env, chatConf.chatId, { id: targetId, name: pl.guestOfName || pl.name, category: 'reminders' },
+        `🗑 The pickup game on <b>${fmtGameDate(week.date)}, ${week.label}</b> was cancelled.`);
+    }
+    return answer('Game cancelled.');
+  }
+
   if (cb.data === 'guest') {
     if (!week.players.some((p) => p.key === `u:${from.id}`)) {
       return answer("Tap \"I'm in\" first — guests are added under someone who's playing.", true);
@@ -1362,7 +1470,7 @@ async function handleCallback(env, cb) {
     // One tap holds the spot under a placeholder name — no typing, no command.
     const sponsor = fullName(from);
     const label = nextGuestLabel(week, sponsor);
-    const newGuest = { key: `g:${from.id}:${label.toLowerCase()}`, name: label, guestOf: from.id, guestOfName: sponsor };
+    const newGuest = { key: `g:${from.id}:${label.toLowerCase()}`, pid: shortId(), name: label, guestOf: from.id, guestOfName: sponsor };
     week.players.push(newGuest);
     await saveEvent(env, week);
 
@@ -1579,13 +1687,72 @@ async function handleCommand(env, msg) {
   if (!week) return;
 
   if (cmd === '/status') {
-    return refreshRoster(env, chatId, week, { repost: true });
+    const events = await listUpcomingEvents(env, group.chatId);
+    for (const e of events.length ? events : [week]) {
+      await refreshRoster(env, chatConf.chatId, e, { repost: true });
+      await saveEvent(env, e);
+    }
+    return;
+  }
+
+  // Anyone can float a pickup game: same roster machinery, its own reminders.
+  if (cmd === '/propose') {
+    const raw = args.join(' ');
+    const [when, locOverride, courtsOverride, perCourtOverride] = raw.split('|').map((x) => x && x.trim());
+    const parsed = when ? parsePropose(when) : null;
+    if (!parsed) {
+      return say(
+        'Usage: /propose Sat 9am — optionally add overrides:\n<code>/propose Sat 9am | Fiesta Park | 2 | 2</code>\n(location | courts | players per court)'
+      );
+    }
+    const over = {};
+    if (locOverride) {
+      over.location = locOverride.slice(0, 60);
+      over.mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(over.location)}`;
+    }
+    const co = parseInt(courtsOverride, 10);
+    if (!Number.isNaN(co) && co >= 1 && co <= 12) over.courts = co;
+    const pc = parseInt(perCourtOverride, 10);
+    if (!Number.isNaN(pc) && pc >= 2 && pc <= 8) over.perCourt = pc;
+
+    const event = newEvent(group, {
+      date: parsed.date,
+      hour: parsed.hour,
+      label: parsed.label,
+      sfx: shortId(),
+      kind: 'proposed',
+      proposedBy: from.id,
+      proposedByName: fullName(from),
+      ...over,
+    });
+    addMember(event, from); // the proposer is obviously playing
+    await saveEvent(env, event);
+    await firedOnce(env, `fired:${group.chatId}:${event.id}:open`); // no double announce
+    await tg(env, 'sendMessage', {
+      chat_id: chatConf.chatId,
+      text: `💡 <b>${esc(fullName(from))}</b> proposed a game: <b>${fmtGameDate(event.date)}, ${event.label}</b> at ${esc(event.location)}. Who's in?`,
+      parse_mode: 'HTML',
+    });
+    await refreshRoster(env, chatConf.chatId, event, { repost: true });
+    await saveEvent(env, event);
+    return;
   }
 
   if (cmd === '/in') {
+    const events = await listUpcomingEvents(env, group.chatId);
+    if (events.length > 1) {
+      return say('Which game?', {
+        reply_markup: {
+          inline_keyboard: events.map((e) => [
+            { text: `${fmtGameDate(e.date)}, ${e.label} · ${e.location}`, callback_data: `in:${e.id}` },
+          ]),
+        },
+      });
+    }
     if (addMember(week, from)) {
       await saveEvent(env, week);
-      await refreshRoster(env, chatId, week);
+      await refreshRoster(env, chatConf.chatId, week);
+      await saveEvent(env, week);
     }
     return;
   }
@@ -1769,6 +1936,7 @@ async function handleCommand(env, msg) {
         '/guest Name — add a guest (no Telegram needed)',
         '/unguest Name — remove your guest',
         '/standby — get pinged when late spots open',
+        '/propose Sat 9am — float a pickup game anyone can join',
         '/status — repost the live roster',
         '/setdays /settime /setlocation /setcourts /setpercourt — admin: event settings',
         '',
@@ -2353,5 +2521,5 @@ export default {
 export {
   groupPlayersIntoCourts, rosterText, describeCascade, localParts, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine,
-  nextOccurrence, eventId, newEvent, CONFIG,
+  nextOccurrence, eventId, newEvent, parsePropose, ensurePids, CONFIG,
 };
