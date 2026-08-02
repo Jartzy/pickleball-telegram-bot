@@ -37,17 +37,6 @@
 
 const CONFIG = {
   timezone: 'America/Los_Angeles',
-  playersPerCourt: 4,
-
-  // The recurring game: Thursday 6:00 AM local time.
-  game: {
-    weekday: 'Thu',
-    hour: 6,
-    label: '6:00 AM',
-    location: 'Bob Baskin Park',
-    courts: 4, // courts available at the venue -> hard cap on sign-ups
-    mapUrl: 'https://www.google.com/maps/search/?api=1&query=Bob+Baskin+Park',
-  },
 
   // Telegram group invite link — shown on the web sign-up page so people can
   // join for realtime updates. Get it in Telegram: group → Manage → Invite
@@ -68,7 +57,6 @@ const CONFIG = {
   webhookUrl: 'https://pickleball-bot.jmartin84.workers.dev/webhook',
   calendarUrl: 'https://pickleball-bot.jmartin84.workers.dev/event.ics',
 
-  // Slot times are derived from the game time — see activeSlots().
 };
 
 /** dateStr +/- n days, stable across DST because it works in pure dates. */
@@ -98,23 +86,6 @@ function eventSlots(event) {
   ];
 }
 
-/**
- * Automation moments, in local time. Derived from the game time so moving the
- * game (e.g. to 8am) moves the final roster and the re-open with it.
- * Each fires once per game week; the cron ticks every 15 minutes.
- */
-function activeSlots() {
-  const g = CONFIG.game;
-  return [
-    // Sign-ups for next week, safely after this week's game has rolled over.
-    { id: 'open', weekday: g.weekday, hour: (g.hour + 2) % 24, minute: 0 },
-    { id: 'rollcall-mon', weekday: 'Mon', hour: 8, minute: 0 },
-    { id: 'rollcall-wed', weekday: 'Wed', hour: 8, minute: 0 },
-    { id: 'lastcall', weekday: 'Wed', hour: 19, minute: 0 },
-    // One hour before the game, whatever time that is.
-    { id: 'final', weekday: g.weekday, hour: (g.hour + 23) % 24, minute: 0 },
-  ];
-}
 
 // ============================================================================
 // TIME HELPERS — everything is computed in the configured timezone
@@ -150,22 +121,6 @@ function localDateStr(date) {
   return `${p.y}-${p.mo}-${p.d}`;
 }
 
-/**
- * The game date (YYYY-MM-DD) currently being organized.
- * = the next game-day whose start hasn't passed; but from 1 hour after game
- *   start onward we roll over to the following week (sign-ups reopen).
- */
-function activeGameDate(now) {
-  for (let i = 0; i <= 8; i++) {
-    const candidate = new Date(now.getTime() + i * 86400000);
-    const p = localParts(candidate);
-    if (p.wd !== CONFIG.game.weekday) continue;
-    // Today IS game day: before (game hour + 1) it's still this week's game.
-    if (i === 0 && localParts(now).hour >= CONFIG.game.hour + 1) continue;
-    return localDateStr(candidate);
-  }
-  return localDateStr(now); // unreachable
-}
 
 /** 'Thu, Jul 23' label for a stored YYYY-MM-DD game date. */
 function fmtGameDate(dateStr) {
@@ -282,37 +237,219 @@ function parseHour(label) {
   return pm && h < 12 ? h + 12 : !pm && h === 12 ? 0 : h;
 }
 
-/** Applies any admin overrides (venue, time, courts) over the compiled config. */
-async function applySettings(env) {
-  const o = await kvGet(env, 'settings');
-  if (!o) return;
-  if (o.perCourt) CONFIG.playersPerCourt = o.perCourt;
-  Object.assign(CONFIG.game, o);
+// ============================================================================
+// GROUPS + EVENTS
+//   group:<chatId>          -> { chatId, title, settings, recurrence,
+//                                testRedirect }
+//   event:<chatId>:<id>     -> full event record; id = <date>T<hh>:<sfx>
+//                              (sfx 'r' = recurring, random = proposed).
+//                              Date-embedded ids make KV list() chronological.
+// ============================================================================
+
+const DEFAULT_SETTINGS = {
+  location: 'Bob Baskin Park',
+  mapUrl: 'https://www.google.com/maps/search/?api=1&query=Bob+Baskin+Park',
+  courts: 4,
+  perCourt: 4,
+};
+const DEFAULT_RECURRENCE = { weekdays: ['Thu'], hour: 6, label: '6:00 AM' };
+
+async function getGroup(env, chatId) {
+  return kvGet(env, `group:${chatId}`);
 }
 
-async function getWeek(env, date) {
-  const stored = (await kvGet(env, `week:${date}`)) || {
-    date,
-    phase: 'open', // open -> rollcall -> urgent (post-cutoff) -> final
-    players: [], // [{ key, name, id?, guestOf?, guestOfName? }] in sign-up order
-    msgId: null, // live roster message to edit
-  };
-  // Compat shim: every consumer reads event fields off this object instead of
-  // global config, so per-event settings become possible without touching them
-  // again. Stored per-event values (future) win over the group defaults.
+/**
+ * Zero-touch upgrade from the singleton era: the first activity involving the
+ * legacy bound chat creates its group record from the old chat/settings keys,
+ * so nothing goes quiet between deploy and an explicit /migrate.
+ */
+async function legacyAutoMigrate(env, chatId = null) {
+  const oldLive = await kvGet(env, 'chat:live');
+  const oldChat = oldLive || (await kvGet(env, 'chat'));
+  if (!oldChat) return null;
+  if (chatId !== null && oldChat.chatId !== chatId) return null;
+  const existing = await getGroup(env, oldChat.chatId);
+  if (existing) return existing;
+
+  const oldSettings = (await kvGet(env, 'settings')) || {};
+  const settings = { ...DEFAULT_SETTINGS };
+  for (const k of ['location', 'mapUrl', 'courts', 'perCourt']) {
+    if (oldSettings[k] !== undefined) settings[k] = oldSettings[k];
+  }
+  const recurrence = { ...DEFAULT_RECURRENCE };
+  if (oldSettings.hour !== undefined) recurrence.hour = oldSettings.hour;
+  if (oldSettings.label !== undefined) recurrence.label = oldSettings.label;
+
+  const group = { chatId: oldChat.chatId, title: '', settings, recurrence, testRedirect: null };
+  await saveGroup(env, group);
+
+  // Carry the current week's roster over, preserving the live message unless
+  // legacy test mode had pointed it at a DM.
+  const date = nextOccurrence(recurrence, new Date());
+  const oldWeek = await kvGet(env, `week:${date}`);
+  if (oldWeek && !(await getEvent(env, group.chatId, eventId(date, recurrence.hour, 'r')))) {
+    const event = {
+      ...newEvent(group, { date, hour: recurrence.hour, label: recurrence.label, sfx: 'r', kind: 'recurring' }),
+      players: oldWeek.players || [],
+      msgId: oldLive ? null : oldWeek.msgId || null,
+      phase: oldWeek.phase || 'open',
+    };
+    await saveEvent(env, event);
+    await firedOnce(env, `fired:${group.chatId}:${event.id}:open`);
+  }
+  const oldStandby = await kvGet(env, 'standby');
+  if (oldStandby && oldStandby.length) await kvPut(env, `standby:${group.chatId}`, oldStandby);
+  return group;
+}
+
+async function saveGroup(env, group) {
+  await kvPut(env, `group:${group.chatId}`, group);
+}
+
+async function listGroups(env) {
+  const out = [];
+  const l = await env.PICKLE_KV.list({ prefix: 'group:' });
+  for (const k of l.keys) {
+    const g = await kvGet(env, k.name);
+    if (g) out.push(g);
+  }
+  return out;
+}
+
+/** The bound group while there is only one; null when none. */
+async function defaultGroup(env) {
+  const groups = await listGroups(env);
+  return groups[0] || (await legacyAutoMigrate(env));
+}
+
+/**
+ * Group whose chat this is — including a test-mode DM redirect, so an admin
+ * poking the bot privately still operates on their real group's data.
+ */
+async function resolveGroupForChat(env, chatId) {
+  const direct = await getGroup(env, chatId);
+  if (direct) return direct;
+  for (const g of await listGroups(env)) if (g.testRedirect === chatId) return g;
+  return legacyAutoMigrate(env, chatId);
+}
+
+/** Where this group's messages go (the DM while test mode is on). */
+function sendTarget(group) {
+  return group.testRedirect || group.chatId;
+}
+
+function eventId(date, hour, sfx) {
+  return `${date}T${String(hour).padStart(2, '0')}:${sfx}`;
+}
+
+async function getEvent(env, chatId, id) {
+  return kvGet(env, `event:${chatId}:${id}`);
+}
+
+async function saveEvent(env, event) {
+  // Self-cleaning: the record evaporates ~30 days after the game.
+  const expiration = Math.floor(utcForLocal(event.date, event.hour).getTime() / 1000) + 30 * 86400;
+  await env.PICKLE_KV.put(`event:${event.chatId}:${event.id}`, JSON.stringify(event), { expiration });
+}
+
+function newEvent(group, { date, hour, label, sfx, kind, ...over }) {
   return {
-    hour: CONFIG.game.hour,
-    label: CONFIG.game.label,
-    location: CONFIG.game.location,
-    mapUrl: CONFIG.game.mapUrl,
-    courts: CONFIG.game.courts,
-    perCourt: CONFIG.playersPerCourt,
-    ...stored,
+    id: eventId(date, hour, sfx),
+    chatId: group.chatId,
+    date,
+    hour,
+    label,
+    location: group.settings.location,
+    mapUrl: group.settings.mapUrl,
+    courts: group.settings.courts,
+    perCourt: group.settings.perCourt,
+    phase: 'open', // open -> rollcall -> urgent -> final -> done
+    players: [], // [{ key, name, id?, guestOf?, guestOfName?, inviteLink? }]
+    msgId: null, // live roster message to edit
+    kind, // 'recurring' | 'proposed'
+    status: 'active', // 'active' | 'cancelled'
+    ...over,
   };
 }
 
-async function saveWeek(env, week) {
-  await kvPut(env, `week:${week.date}`, week);
+/** Upcoming playable events for a group, soonest first. */
+async function listUpcomingEvents(env, chatId) {
+  const l = await env.PICKLE_KV.list({ prefix: `event:${chatId}:` });
+  const events = [];
+  for (const k of l.keys.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    const e = await kvGet(env, k.name);
+    if (e && e.status === 'active' && e.phase !== 'done') events.push(e);
+  }
+  return events;
+}
+
+/**
+ * Next occurrence of the recurrence: the soonest listed weekday whose start+1h
+ * hasn't passed — the same rollover rule the single-game bot used, but over a
+ * weekday array (the singles group plays Sun/Mon/Tue).
+ */
+function nextOccurrence(recurrence, now) {
+  for (let i = 0; i <= 8; i++) {
+    const candidate = new Date(now.getTime() + i * 86400000);
+    const p = localParts(candidate);
+    if (!recurrence.weekdays.includes(p.wd)) continue;
+    if (i === 0 && localParts(now).hour >= recurrence.hour + 1) continue;
+    return localDateStr(candidate);
+  }
+  return localDateStr(now); // unreachable
+}
+
+/**
+ * Ensures the next recurring event exists. The deterministic ':r' id makes
+ * this a race-safe upsert — two cron ticks land on the same key.
+ */
+async function materializeRecurring(env, group, now = new Date()) {
+  if (!group.recurrence) return { event: null, created: false };
+  const date = nextOccurrence(group.recurrence, now);
+  const id = eventId(date, group.recurrence.hour, 'r');
+  const existing = await getEvent(env, group.chatId, id);
+  if (existing) return { event: existing, created: false };
+  const event = newEvent(group, {
+    date,
+    hour: group.recurrence.hour,
+    label: group.recurrence.label,
+    sfx: 'r',
+    kind: 'recurring',
+  });
+  await saveEvent(env, event);
+  return { event, created: true };
+}
+
+/**
+ * Pushes changed group settings onto the upcoming recurring event. A changed
+ * hour changes the event id (the id embeds it), so the record is re-keyed
+ * with players and roster message preserved. Proposals keep their own fields.
+ */
+async function applyGroupSettingsToRecurring(env, group, event) {
+  if (!event || event.kind !== 'recurring') return event;
+  const r = group.recurrence;
+  const wantId = r ? eventId(event.date, r.hour, 'r') : event.id;
+  Object.assign(event, {
+    location: group.settings.location,
+    mapUrl: group.settings.mapUrl,
+    courts: group.settings.courts,
+    perCourt: group.settings.perCourt,
+    ...(r ? { hour: r.hour, label: r.label } : {}),
+  });
+  if (wantId !== event.id) {
+    await env.PICKLE_KV.delete(`event:${event.chatId}:${event.id}`);
+    event.id = wantId;
+  }
+  await saveEvent(env, event);
+  return event;
+}
+
+/** The event bare commands and taps act on: the soonest upcoming one. */
+async function soonestEvent(env, group) {
+  const events = await listUpcomingEvents(env, group.chatId);
+  if (events.length) return events[0];
+  const { event } = await materializeRecurring(env, group);
+  return event;
 }
 
 // ============================================================================
@@ -790,29 +927,22 @@ async function notifyPlayer(env, groupChatId, user, text, extra = {}) {
 // joins the group and claims the spot — no tokens for anyone to paste.
 // ---------------------------------------------------------------------------
 
-async function liveGroupId(env, fallback) {
-  const live = await kvGet(env, 'chat:live');
-  return live ? live.chatId : fallback;
-}
-
 async function isGroupAdmin(env, groupId, userId) {
   const m = await tg(env, 'getChatMember', { chat_id: groupId, user_id: userId });
   return m.ok && ['creator', 'administrator'].includes(m.result.status);
 }
 
-async function mintGuestInvite(env, chatId, week, player) {
-  // In test mode `chat` points at a DM, and you cannot mint an invite link for
-  // a private chat — always target the real group.
-  const live = await kvGet(env, 'chat:live');
-  const target = live ? live.chatId : chatId;
+async function mintGuestInvite(env, group, week, player) {
+  // Always the real group — you cannot mint an invite link for a DM, and in
+  // test mode the send target IS a DM.
   const res = await tg(env, 'createChatInviteLink', {
-    chat_id: target,
+    chat_id: group.chatId,
     name: player.name.slice(0, 32),
     member_limit: 1, // single use: a forwarded link dies after the first join
   });
   if (!res.ok) return null;
   const link = res.result.invite_link;
-  await kvPut(env, `invite:${link}`, { date: week.date, key: player.key });
+  await kvPut(env, `invite:${link}`, { chatId: group.chatId, eventId: week.id, key: player.key });
   player.inviteLink = link; // so it can be re-shown if the sponsor loses it
   return link;
 }
@@ -831,22 +961,27 @@ async function handleChatMember(env, upd) {
   if (!rec) return;
 
   await env.PICKLE_KV.delete(`invite:${link}`); // one claim only
-  const currentDate = activeGameDate(new Date());
   const user = upd.new_chat_member.user;
 
-  // Link from a game that has already happened: they're in the group, but
-  // there's no spot to claim. Welcome them and point at the live roster.
-  if (rec.date !== currentDate) {
-    const nextWeek = await getWeek(env, currentDate);
+  const group = await getGroup(env, rec.chatId);
+  if (!group) return;
+  const week = rec.eventId ? await getEvent(env, rec.chatId, rec.eventId) : null;
+
+  // The event is over/cancelled/gone: they're in the group, but there's no
+  // spot to claim. Welcome them and point at the next game.
+  if (!week || week.status !== 'active' || week.phase === 'done') {
+    const nextWeek = await soonestEvent(env, group);
     await dmUser(
       env,
       user.id,
-      `👋 Welcome! That invite was for ${fmtGameDate(rec.date)}, which has already been played.\nThe next game is <b>${fmtGameDate(currentDate)}, ${nextWeek.label}</b> at ${esc(nextWeek.location)} — tap ✅ I'm in on the roster to grab a spot.`
+      `👋 Welcome! That invite was for a game that's already been played.` +
+        (nextWeek
+          ? `\nThe next one is <b>${fmtGameDate(nextWeek.date)}, ${nextWeek.label}</b> at ${esc(nextWeek.location)} — tap ✅ I'm in on the roster to grab a spot.`
+          : '')
     );
     return;
   }
 
-  const week = await getWeek(env, rec.date);
   const idx = week.players.findIndex((p) => p.key === rec.key);
 
   // The spot they were invited to is gone (usually the sponsor dropped out).
@@ -860,8 +995,7 @@ async function handleChatMember(env, upd) {
     return;
   }
 
-  const chatConf = await kvGet(env, 'chat');
-  if (!chatConf) return;
+  const chatConf = { chatId: sendTarget(group) };
   const placeholder = week.players[idx];
   const sponsorId = placeholder.guestOf;
   const sponsorName = placeholder.guestOfName;
@@ -875,7 +1009,7 @@ async function handleChatMember(env, upd) {
     week.players[idx] = { key: selfKey, id: user.id, name: fullName(user) };
   }
 
-  await saveWeek(env, week);
+  await saveEvent(env, week);
   await refreshRoster(env, chatConf.chatId, week);
 
   const who = fullName(user);
@@ -1097,7 +1231,7 @@ async function sendRecruitingAlert(env, chatId, week, intro) {
   const partial = courts.find((c) => !c.isConfirmed);
   if (!partial) return;
 
-  const standby = await kvGet(env, 'standby', []);
+  const standby = await kvGet(env, `standby:${week.chatId}`, []);
   const lines = [];
   if (intro) lines.push(intro);
 
@@ -1125,48 +1259,20 @@ async function sendRecruitingAlert(env, chatId, week, intro) {
 // ============================================================================
 
 async function handleCallback(env, cb) {
-  const chatConf = await kvGet(env, 'chat');
   const answer = (text, alert = false) =>
     tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert });
 
-  if (!chatConf) return answer('Bot not set up yet — an admin must run /setup in the group.');
-
-  const week = await getWeek(env, activeGameDate(new Date()));
   const from = cb.from;
+  const cbChatId = cb.message && cb.message.chat && cb.message.chat.id;
 
-  if (cb.data === 'gconfirm') {
-    return answer('Great — nothing changed. Thanks for confirming!', true);
-  }
-
-  if (cb.data === 'gcancel' || cb.data === 'gcancelall' || cb.data.startsWith('gcancel:')) {
-    const all = cb.data === 'gcancelall';
-    const key = all ? null : cb.data.slice('gcancel:'.length);
-    const before = [...week.players];
-    const doomed = week.players.filter((p) =>
-      all ? p.guestOf === from.id : p.key === key && p.guestOf === from.id
-    );
-    if (doomed.length === 0) return answer('That guest is already off the roster.', true);
-    week.players = week.players.filter((p) => !doomed.includes(p));
-    await saveWeek(env, week);
-    const names = doomed.map((d) => d.name);
-    await postChange(
-      env,
-      chatConf.chatId,
-      week,
-      `❌ <b>${esc(names.join(', '))}</b> can no longer make it.\n${headcountLine(week)}`
-    );
-    await sendRecruitingAlert(env, chatConf.chatId, week, null);
-    await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
-    return answer(`Removed ${names.join(', ')}. Thanks for the heads-up!`, true);
-  }
-
+  // Preference toggles live in DMs and need no group at all — handle first.
   if (cb.data.startsWith('pref:')) {
     const which = cb.data.slice(5);
-    const rec = (await getDmRecord(env, from.id)) || { chatId: cb.message && cb.message.chat.id };
+    const rec = (await getDmRecord(env, from.id)) || { chatId: cbChatId };
     if (which === 'show') {
       const card = notificationsCard(rec);
       await tg(env, 'sendMessage', {
-        chat_id: cb.message.chat.id,
+        chat_id: cbChatId,
         text: card.text,
         parse_mode: 'HTML',
         reply_markup: card.reply_markup,
@@ -1181,13 +1287,49 @@ async function handleCallback(env, cb) {
     await kvPut(env, `dm:${from.id}`, rec);
     const card = notificationsCard(rec);
     await tg(env, 'editMessageText', {
-      chat_id: cb.message.chat.id,
+      chat_id: cbChatId,
       message_id: cb.message.message_id,
       text: card.text,
       parse_mode: 'HTML',
       reply_markup: card.reply_markup,
     });
     return answer('Updated.');
+  }
+
+  // Roster taps: find the group this chat belongs to. Taps in a DM (guest
+  // roll-call cards, test mode) fall back to the caller's group.
+  let group = await resolveGroupForChat(env, cbChatId);
+  if (!group) group = await defaultGroup(env);
+  if (!group) return answer('Bot not set up yet — an admin must run /setup in the group.');
+
+  const week = await soonestEvent(env, group);
+  if (!week) return answer('No upcoming game to act on.');
+  const chatConf = { chatId: sendTarget(group) };
+
+  if (cb.data === 'gconfirm') {
+    return answer('Great — nothing changed. Thanks for confirming!', true);
+  }
+
+  if (cb.data === 'gcancel' || cb.data === 'gcancelall' || cb.data.startsWith('gcancel:')) {
+    const all = cb.data === 'gcancelall';
+    const key = all ? null : cb.data.slice('gcancel:'.length);
+    const before = [...week.players];
+    const doomed = week.players.filter((p) =>
+      all ? p.guestOf === from.id : p.key === key && p.guestOf === from.id
+    );
+    if (doomed.length === 0) return answer('That guest is already off the roster.', true);
+    week.players = week.players.filter((p) => !doomed.includes(p));
+    await saveEvent(env, week);
+    const names = doomed.map((d) => d.name);
+    await postChange(
+      env,
+      chatConf.chatId,
+      week,
+      `❌ <b>${esc(names.join(', '))}</b> can no longer make it.\n${headcountLine(week)}`
+    );
+    await sendRecruitingAlert(env, chatConf.chatId, week, null);
+    await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
+    return answer(`Removed ${names.join(', ')}. Thanks for the heads-up!`, true);
   }
 
   if (cb.data === 'guest') {
@@ -1200,12 +1342,12 @@ async function handleCallback(env, cb) {
     const label = nextGuestLabel(week, sponsor);
     const newGuest = { key: `g:${from.id}:${label.toLowerCase()}`, name: label, guestOf: from.id, guestOfName: sponsor };
     week.players.push(newGuest);
-    await saveWeek(env, week);
+    await saveEvent(env, week);
 
     // One-use link bound to THIS placeholder: tapping it joins the group and
     // claims this exact spot.
-    const link = await mintGuestInvite(env, chatConf.chatId, week, newGuest);
-    await saveWeek(env, week); // persist the stored claim link
+    const link = await mintGuestInvite(env, group, week, newGuest);
+    await saveEvent(env, week); // persist the stored claim link
 
     const personal = link
       ? `✅ Spot saved for your guest.\n\nSend them this:\n\n<i>Pickleball ${fmtGameDate(week.date)}, ${week.label} at ${esc(week.location)}. You're on the list — tap to join us: ${link}</i>\n\nThat link is just for them and works once. When they tap it they're in the group and the spot becomes theirs.`
@@ -1231,7 +1373,7 @@ async function handleCallback(env, cb) {
       const before = [...week.players];
       const removed = removeMember(week, from.id);
       if (removed.length === 0) return answer("You weren't on the roster.");
-      await saveWeek(env, week);
+      await saveEvent(env, week);
       await refreshRoster(env, chatConf.chatId, week, { repost: false });
       await tg(env, 'sendMessage', {
         chat_id: chatConf.chatId,
@@ -1253,7 +1395,7 @@ async function handleCallback(env, cb) {
     }
     if (isFull(week)) return answer(`All ${week.courts} courts are full (${maxPlayers(week)} players).`, true);
     addMember(week, from);
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     const pos = week.players.length;
     const court = Math.floor((pos - 1) / week.perCourt) + 1;
     await postChange(env, chatConf.chatId, week, `✅ <b>${esc(fullName(from))}</b> is in.\n${headcountLine(week)}`);
@@ -1273,7 +1415,7 @@ async function handleCallback(env, cb) {
     if (removed.length === 0) {
       return answer("You're not on the roster this week, so there's nothing to drop.", true);
     }
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     const alsoGuests = removed.length - 1;
     await postChange(
       env,
@@ -1320,27 +1462,38 @@ async function handleCommand(env, msg) {
     return say(card.text, { reply_markup: card.reply_markup });
   }
 
-  // Sandbox: point the bot at this DM so testing doesn't spam the group.
+  // Sandbox: point a group's output at this DM so testing doesn't spam it.
   if (cmd === '/testmode' && msg.chat.type === 'private') {
-    const live = await kvGet(env, 'chat');
-    if (live && live.chatId !== chatId) await kvPut(env, 'chat:live', live);
-    await kvPut(env, 'chat', { chatId });
-    const week = await getWeek(env, activeGameDate(new Date()));
-    week.msgId = null; // the live roster message lives in the group
-    await saveWeek(env, week);
+    const groups = await listGroups(env);
+    const mine = [];
+    for (const g of groups) if (await isGroupAdmin(env, g.chatId, from.id)) mine.push(g);
+    if (!mine.length) return say('No group where you are an admin — run /setup inside your group first.');
+    const g = mine[0]; // one group today; a picker arrives with multi-group
+    g.testRedirect = chatId;
+    await saveGroup(env, g);
+    const week = await soonestEvent(env, g);
+    if (week) {
+      week.msgId = null; // the live roster message lives in the group
+      await saveEvent(env, week);
+    }
     return say(
-      '🧪 <b>Test mode on.</b> Every bot message now comes here instead of the group, so you can poke at things without spamming anyone.\n\nThe roster data is shared — changes you make here are real. Send /livemode when you\'re done.'
+      `🧪 <b>Test mode on</b> for <b>${esc(g.title || 'your group')}</b>. Its bot messages come here instead, so you can poke at things without spamming anyone.\n\nThe roster data is shared — changes you make here are real. Send /livemode when you're done.`
     );
   }
 
   if (cmd === '/livemode' && msg.chat.type === 'private') {
-    const live = await kvGet(env, 'chat:live');
-    if (!live) return say('No saved group binding — run /setup inside the group.');
-    await kvPut(env, 'chat', live);
-    await env.PICKLE_KV.delete('chat:live');
-    const week = await getWeek(env, activeGameDate(new Date()));
-    week.msgId = null; // force a fresh roster post back in the group
-    await saveWeek(env, week);
+    const groups = await listGroups(env);
+    const g = groups.find((x) => x.testRedirect === chatId);
+    if (!g) return say('Test mode is not on for any of your groups.');
+    g.testRedirect = null;
+    await saveGroup(env, g);
+    const week = await soonestEvent(env, g);
+    if (week) {
+      week.msgId = null; // force a fresh roster post back in the group
+      await saveEvent(env, week);
+      await refreshRoster(env, g.chatId, week, { repost: true });
+      await saveEvent(env, week);
+    }
     return say('✅ <b>Back to live.</b> Messages go to the group again.');
   }
 
@@ -1364,17 +1517,34 @@ async function handleCommand(env, msg) {
     if (status !== 'creator' && status !== 'administrator') {
       return say('Only a group admin can run /setup.');
     }
-    await kvPut(env, 'chat', { chatId });
-    const week = await getWeek(env, activeGameDate(new Date()));
-    await saveWeek(env, week);
-    await say(`✅ Bot bound to this group. Game: <b>every ${CONFIG.game.weekday} ${CONFIG.game.label}</b> (${CONFIG.timezone}).`);
-    return refreshRoster(env, chatId, week, { repost: true });
+    const existing = await getGroup(env, chatId);
+    const group = existing || {
+      chatId,
+      title: msg.chat.title || '',
+      settings: { ...DEFAULT_SETTINGS },
+      recurrence: { ...DEFAULT_RECURRENCE },
+      testRedirect: null,
+    };
+    group.title = msg.chat.title || group.title;
+    await saveGroup(env, group);
+    const week = await soonestEvent(env, group);
+    const r = group.recurrence;
+    await say(
+      `✅ Bot bound to this group. Game: <b>every ${r ? r.weekdays.join('/') : '—'} ${r ? r.label : ''}</b> (${CONFIG.timezone}).`
+    );
+    if (week) {
+      await refreshRoster(env, chatId, week, { repost: true });
+      await saveEvent(env, week);
+    }
+    return;
   }
 
-  const chatConf = await kvGet(env, 'chat');
-  if (!chatConf || chatConf.chatId !== chatId) return; // ignore other chats
+  const group = await resolveGroupForChat(env, chatId);
+  if (!group) return; // not a bound group (or its test DM) — stay silent
 
-  const week = await getWeek(env, activeGameDate(new Date()));
+  const chatConf = { chatId: sendTarget(group) };
+  const week = await soonestEvent(env, group);
+  if (!week) return;
 
   if (cmd === '/status') {
     return refreshRoster(env, chatId, week, { repost: true });
@@ -1382,7 +1552,7 @@ async function handleCommand(env, msg) {
 
   if (cmd === '/in') {
     if (addMember(week, from)) {
-      await saveWeek(env, week);
+      await saveEvent(env, week);
       await refreshRoster(env, chatId, week);
     }
     return;
@@ -1392,7 +1562,7 @@ async function handleCommand(env, msg) {
     const before = [...week.players];
     const removed = removeMember(week, from.id);
     if (removed.length > 0) {
-      await saveWeek(env, week);
+      await saveEvent(env, week);
       await refreshRoster(env, chatId, week);
       if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players, week.perCourt)) {
         await say(describeCascade(before, week, removed.map((r) => r.name)));
@@ -1414,7 +1584,6 @@ async function handleCommand(env, msg) {
   }
 
   if (cmd === '/calendar') {
-    const week = await getWeek(env, activeGameDate(new Date()));
     return say(`📅 ${fmtGameDate(week.date)}, ${week.label} at ${esc(week.location)}`, {
       reply_markup: { inline_keyboard: calendarButtons(week) },
     });
@@ -1427,36 +1596,37 @@ async function handleCommand(env, msg) {
       if (st !== 'creator' && st !== 'administrator') return say('Admins only.');
     }
     const value = args.join(' ').trim();
-    const current = (await kvGet(env, 'settings')) || {};
     if (!value) {
+      const r = group.recurrence;
       return say(
-        `Current: <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}, ${CONFIG.game.courts} courts.\n` +
+        `Current: <b>${esc(group.settings.location)}</b>, ${esc(r ? r.label : '—')}, ${group.settings.courts} courts, ${group.settings.perCourt}/court.\n` +
           'Usage: /setlocation Name | https://maps-link · /settime 6:30 AM · /setcourts 3'
       );
     }
     if (cmd === '/setlocation') {
       const [name, mapUrl] = value.split('|').map((x) => x.trim());
-      current.location = name;
-      if (mapUrl) current.mapUrl = mapUrl;
-      else current.mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
+      group.settings.location = name;
+      group.settings.mapUrl = mapUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
     } else if (cmd === '/settime') {
       const hour = parseHour(value);
       if (hour === null) return say('Try: /settime 6:30 AM');
-      current.label = value;
-      current.hour = hour;
+      if (group.recurrence) {
+        group.recurrence.label = value;
+        group.recurrence.hour = hour;
+      }
     } else {
-      const n = parseInt(value, 10);
-      if (Number.isNaN(n) || n < 1 || n > 12) return say('Try: /setcourts 4');
-      current.courts = n;
+      const cn = parseInt(value, 10);
+      if (Number.isNaN(cn) || cn < 1 || cn > 12) return say('Try: /setcourts 4');
+      group.settings.courts = cn;
     }
-    await kvPut(env, 'settings', current);
-    Object.assign(CONFIG.game, current);
-    const week = await getWeek(env, activeGameDate(new Date()));
+    await saveGroup(env, group);
+    const updated = await applyGroupSettingsToRecurring(env, group, week);
+    const r2 = group.recurrence;
     await say(
-      `✅ Updated. Now: <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}, ${CONFIG.game.courts} courts.`
+      `✅ Updated. Now: <b>${esc(group.settings.location)}</b>, ${esc(r2 ? r2.label : '—')}, ${group.settings.courts} courts.`
     );
-    const conf = await kvGet(env, 'chat');
-    if (conf) await refreshRoster(env, conf.chatId, week, { repost: true });
+    if (updated) await refreshRoster(env, sendTarget(group), updated, { repost: true });
+    if (updated) await saveEvent(env, updated);
     return;
   }
 
@@ -1476,7 +1646,7 @@ async function handleCommand(env, msg) {
     const before = [...week.players];
     const [gone] = week.players.splice(idx, 1);
     // Guests stay put — removing them is a separate, deliberate choice.
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     await refreshRoster(env, chatId, week);
     await say(describeCascade(before, week, [gone.name]));
     await notifyPromotions(env, chatId, week, computePromotions(before, week));
@@ -1490,7 +1660,7 @@ async function handleCommand(env, msg) {
     const key = `g:${from.id}:${name.toLowerCase()}`;
     if (findPlayer(week, key) !== -1) return say(`${esc(name)} is already on the roster.`);
     week.players.push({ key, name, guestOf: from.id, guestOfName: fullName(from) });
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     return refreshRoster(env, chatId, week);
   }
 
@@ -1501,7 +1671,7 @@ async function handleCommand(env, msg) {
     if (idx === -1) return say(`No guest named "${esc(name)}" under your name.`);
     const before = [...week.players];
     week.players.splice(idx, 1);
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     await refreshRoster(env, chatId, week);
     if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players, week.perCourt)) {
       await say(describeCascade(before, week, [name]));
@@ -1512,15 +1682,16 @@ async function handleCommand(env, msg) {
   }
 
   if (cmd === '/standby') {
-    const standby = await kvGet(env, 'standby', []);
+    const standbyKey = `standby:${group.chatId}`;
+    const standby = await kvGet(env, standbyKey, []);
     const existing = standby.findIndex((s) => s.id === from.id);
     if (existing === -1) {
       standby.push({ id: from.id, name: fullName(from) });
-      await kvPut(env, 'standby', standby);
+      await kvPut(env, standbyKey, standby);
       return say(`🖐 ${esc(fullName(from))} joined the standby pool — you'll be pinged when a late spot opens.`);
     }
     standby.splice(existing, 1);
-    await kvPut(env, 'standby', standby);
+    await kvPut(env, standbyKey, standby);
     return say(`${esc(fullName(from))} left the standby pool.`);
   }
 
@@ -1536,7 +1707,9 @@ async function handleCommand(env, msg) {
         '/standby — get pinged when late spots open',
         '/status — repost the live roster',
         '',
-        `Game: every ${CONFIG.game.weekday} ${CONFIG.game.label} Pacific. Roll call Wed 7pm, cutoff 9:30pm, final roster 5:15am.`,
+        group.recurrence
+          ? `Game: every ${group.recurrence.weekdays.join('/')} ${group.recurrence.label} Pacific. Reminders Mon + 2 days out, last call the evening before, final roster an hour before.`
+          : 'No recurring game configured.',
       ].join('\n')
     );
   }
@@ -1546,36 +1719,21 @@ async function handleCommand(env, msg) {
 // SCHEDULED SLOTS (cron: every 15 min; act only at the configured local times)
 // ============================================================================
 
-async function runSlot(env, slotId, now) {
-  const chatConf = await kvGet(env, 'chat');
-  if (!chatConf) return; // not set up yet
-  const chatId = chatConf.chatId;
-  const week = await getWeek(env, activeGameDate(now));
+async function runSlot(env, group, week, slotId) {
+  const chatId = sendTarget(group);
   const label = `${fmtGameDate(week.date)}, ${week.label}`;
 
-  if (slotId === 'open') {
-    // Fires after this week's game, so activeGameDate has rolled to NEXT week.
-    week.msgId = null;
-    await tg(env, 'sendMessage', {
-      chat_id: chatId,
-      text: `🏓 <b>${label}</b> is open. First in, first on court.`,
-      parse_mode: 'HTML',
-    });
-    await refreshRoster(env, chatId, week, { repost: true });
-    await saveWeek(env, week);
-  }
-
-  if (slotId === 'rollcall-mon') {
+  if (slotId === 'remind-3d') {
     await tg(env, 'sendMessage', {
       chat_id: chatId,
       text: `🏓 <b>${label}</b> — who's playing?\n${headcountLine(week)}\n\nIn or out below. Sorting it now beats sorting it Wednesday night.`,
       parse_mode: 'HTML',
     });
     await refreshRoster(env, chatId, week, { repost: true });
-    await saveWeek(env, week);
+    await saveEvent(env, week);
   }
 
-  if (slotId === 'rollcall-wed') {
+  if (slotId === 'remind-1d') {
     week.phase = 'rollcall';
     await tg(env, 'sendMessage', {
       chat_id: chatId,
@@ -1583,13 +1741,13 @@ async function runSlot(env, slotId, now) {
       parse_mode: 'HTML',
     });
     await refreshRoster(env, chatId, week, { repost: true });
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     await askSponsorsToConfirmGuests(env, week);
   }
 
   if (slotId === 'lastcall') {
     week.phase = 'urgent';
-    await saveWeek(env, week);
+    await saveEvent(env, week);
     const state = lastCallState(week);
     if (state === 'short') {
       const need = week.perCourt - week.players.length;
@@ -1639,29 +1797,53 @@ async function runSlot(env, slotId, now) {
     week.phase = 'final';
     week.msgId = null;
     await refreshRoster(env, chatId, week, { repost: true });
-    await saveWeek(env, week);
+    await saveEvent(env, week);
   }
+}
+
+async function firedOnce(env, key) {
+  if (await env.PICKLE_KV.get(key)) return false;
+  await env.PICKLE_KV.put(key, '1', { expirationTtl: 60 * 60 * 24 * 14 });
+  return true;
 }
 
 async function handleScheduled(env) {
   const now = new Date();
   const local = localParts(now);
+  const today = localDateStr(now);
 
-  for (const slot of activeSlots()) {
-    const inWindow =
-      local.wd === slot.weekday &&
-      local.hour === slot.hour &&
-      local.minute >= slot.minute &&
-      local.minute < slot.minute + 15;
-    if (!inWindow) continue;
+  for (const group of await listGroups(env)) {
+    // 1. Keep the next recurring event materialized; announce it once.
+    const { event: rec } = await materializeRecurring(env, group, now);
+    if (rec && (await firedOnce(env, `fired:${group.chatId}:${rec.id}:open`))) {
+      await tg(env, 'sendMessage', {
+        chat_id: sendTarget(group),
+        text: `🏓 <b>${fmtGameDate(rec.date)}, ${rec.label}</b> is open. First in, first on court.`,
+        parse_mode: 'HTML',
+      });
+      await refreshRoster(env, sendTarget(group), rec, { repost: true });
+      await saveEvent(env, rec);
+    }
 
-    // Idempotency: each slot fires once per game week even if cron double-fires.
-    const gameDate = activeGameDate(now);
-    const firedKey = `fired:${slot.id}:${gameDate}`;
-    if (await env.PICKLE_KV.get(firedKey)) continue;
-    await env.PICKLE_KV.put(firedKey, '1', { expirationTtl: 60 * 60 * 24 * 14 });
-
-    await runSlot(env, slot.id, now);
+    // 2. Fire due reminder slots per event; retire events 2h after start.
+    for (const event of await listUpcomingEvents(env, group.chatId)) {
+      const startMs = utcForLocal(event.date, event.hour).getTime();
+      if (now.getTime() > startMs + 2 * 3600 * 1000) {
+        event.phase = 'done';
+        await saveEvent(env, event);
+        continue;
+      }
+      for (const slot of eventSlots(event)) {
+        const inWindow =
+          slot.date === today &&
+          local.hour === slot.hour &&
+          local.minute >= slot.minute &&
+          local.minute < slot.minute + 15;
+        if (!inWindow) continue;
+        if (!(await firedOnce(env, `fired:${group.chatId}:${event.id}:${slot.id}`))) continue;
+        await runSlot(env, group, event, slot.id);
+      }
+    }
   }
 }
 
@@ -1671,7 +1853,6 @@ async function handleScheduled(env) {
 
 export default {
   async fetch(request, env) {
-    await applySettings(env);
     const url = new URL(request.url);
 
     if (url.pathname === '/webhook' && request.method === 'POST') {
@@ -1682,14 +1863,32 @@ export default {
       const update = await request.json();
       try {
         if (update.callback_query) await handleCallback(env, update.callback_query);
-        // A group upgraded to a supergroup gets a NEW chat id. Re-bind, or every
-        // later post goes to the dead chat and permission checks read stale.
+        // A group upgraded to a supergroup gets a NEW chat id: re-key the
+        // group record and its events, or posts go to a dead chat.
         else if (update.message && update.message.migrate_to_chat_id) {
-          await kvPut(env, 'chat', { chatId: update.message.migrate_to_chat_id });
-          const week = await getWeek(env, activeGameDate(new Date()));
-          week.msgId = null; // old message lives in the old chat
-          await saveWeek(env, week);
-          await refreshRoster(env, update.message.migrate_to_chat_id, week, { repost: true });
+          const oldId = update.message.chat.id;
+          const newId = update.message.migrate_to_chat_id;
+          const g = await getGroup(env, oldId);
+          if (g) {
+            const l = await env.PICKLE_KV.list({ prefix: `event:${oldId}:` });
+            for (const k of l.keys) {
+              const e = await kvGet(env, k.name);
+              if (e) {
+                e.chatId = newId;
+                e.msgId = null; // old message lives in the old chat
+                await saveEvent(env, e);
+              }
+              await env.PICKLE_KV.delete(k.name);
+            }
+            g.chatId = newId;
+            await saveGroup(env, g);
+            await env.PICKLE_KV.delete(`group:${oldId}`);
+            const week = await soonestEvent(env, g);
+            if (week) {
+              await refreshRoster(env, newId, week, { repost: true });
+              await saveEvent(env, week);
+            }
+          }
         } else if (update.chat_member) await handleChatMember(env, update.chat_member);
         else if (update.message && update.message.text) await handleCommand(env, update.message);
       } catch (err) {
@@ -1700,9 +1899,16 @@ export default {
 
     // --- Calendar file for the game (add-to-calendar links point here) ---
     if (url.pathname === '/event.ics') {
-      const dateStr = url.searchParams.get('date') || activeGameDate(new Date());
-      const icsWeek = await getWeek(env, dateStr);
-      const date = dateStr.replace(/-/g, '');
+      const group = await defaultGroup(env);
+      if (!group) return new Response('Bot not set up yet.', { status: 503 });
+      const wantDate = url.searchParams.get('date');
+      const upcoming = await listUpcomingEvents(env, group.chatId);
+      const icsWeek =
+        (wantDate && upcoming.find((e) => e.date === wantDate)) ||
+        upcoming[0] ||
+        (await soonestEvent(env, group));
+      if (!icsWeek) return new Response('No upcoming game.', { status: 404 });
+      const date = icsWeek.date.replace(/-/g, '');
       const hh = String(icsWeek.hour).padStart(2, '0');
       const endHh = String((icsWeek.hour + 2) % 24).padStart(2, '0');
       const ics = [
@@ -1747,12 +1953,14 @@ export default {
         allowed_updates: ['message', 'callback_query', 'chat_member'],
       });
       const me = await tg(env, 'getMe', {});
-      const chatConf = await kvGet(env, 'chat');
-      let rights = 'unknown (bot not bound to a group yet)';
-      if (chatConf && me.ok) {
-        const m = await tg(env, 'getChatMember', { chat_id: chatConf.chatId, user_id: me.result.id });
-        if (m.ok) {
-          rights = `status=${m.result.status}, can_invite_users=${m.result.can_invite_users}`;
+      const groups = await listGroups(env);
+      let rights = groups.length ? '' : 'unknown (bot not bound to a group yet)';
+      if (me.ok) {
+        for (const g of groups) {
+          const m = await tg(env, 'getChatMember', { chat_id: g.chatId, user_id: me.result.id });
+          rights += `${g.title || g.chatId}: ${
+            m.ok ? `status=${m.result.status}, can_invite_users=${m.result.can_invite_users}` : 'lookup failed'
+          }; `;
         }
       }
       // Read it back so the result is verified, not just claimed.
@@ -1774,6 +1982,93 @@ export default {
       );
     }
 
+    // --- One-time migration from the singleton schema (chat/week:/settings)
+    //     to per-group keying. Idempotent; ?dry=1 previews without writing.
+    if (url.pathname === '/migrate') {
+      if (!env.WEBHOOK_SECRET) {
+        return new Response('WEBHOOK_SECRET is not set on the Worker', { status: 503 });
+      }
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const dry = url.searchParams.get('dry') === '1';
+      const report = [];
+      // If the legacy test mode was left on, `chat` points at a DM and the
+      // REAL group is stashed in chat:live — recover it instead of refusing
+      // (the old /livemode no longer exists to clear it).
+      const oldLive = await kvGet(env, 'chat:live');
+      const oldChat = oldLive || (await kvGet(env, 'chat'));
+      if (!oldChat) return new Response('Nothing to migrate: no legacy chat binding.', { status: 200 });
+      const chatId = oldChat.chatId;
+      const wasTestMode = !!oldLive;
+      if (wasTestMode) report.push('legacy test mode detected — migrating the REAL group; roster message will repost');
+
+      const oldSettings = (await kvGet(env, 'settings')) || {};
+      const settings = { ...DEFAULT_SETTINGS };
+      for (const k of ['location', 'mapUrl', 'courts', 'perCourt']) {
+        if (oldSettings[k] !== undefined) settings[k] = oldSettings[k];
+      }
+      const recurrence = { ...DEFAULT_RECURRENCE };
+      if (oldSettings.hour !== undefined) recurrence.hour = oldSettings.hour;
+      if (oldSettings.label !== undefined) recurrence.label = oldSettings.label;
+
+      const existing = await getGroup(env, chatId);
+      const group = existing || { chatId, title: '', settings, recurrence, testRedirect: null };
+      report.push(`group:${chatId} ${existing ? 'exists (kept)' : 'created'}`);
+      if (!dry && !existing) await saveGroup(env, group);
+
+      // Current week -> recurring event, preserving players/msgId/phase so the
+      // live pinned roster keeps editing in place.
+      const date = nextOccurrence(recurrence, new Date());
+      const wid = eventId(date, recurrence.hour, 'r');
+      const already = await getEvent(env, chatId, wid);
+      const oldWeek = await kvGet(env, `week:${date}`);
+      if (already) {
+        report.push(`event ${wid} exists (kept)`);
+      } else if (oldWeek) {
+        const event = {
+          ...newEvent(group, { date, hour: recurrence.hour, label: recurrence.label, sfx: 'r', kind: 'recurring' }),
+          players: oldWeek.players || [],
+          msgId: wasTestMode ? null : oldWeek.msgId || null,
+          phase: oldWeek.phase || 'open',
+        };
+        report.push(`event ${wid} migrated from week:${date} (${event.players.length} players, msgId=${event.msgId})`);
+        if (!dry) {
+          await saveEvent(env, event);
+          await firedOnce(env, `fired:${chatId}:${wid}:open`); // already announced in its day
+        }
+      } else {
+        report.push(`event ${wid} would be freshly materialized (no week:${date} found)`);
+        if (!dry) {
+          await materializeRecurring(env, group);
+          await firedOnce(env, `fired:${chatId}:${wid}:open`);
+        }
+      }
+
+      // Guest invite records gain chatId + eventId.
+      const invites = await env.PICKLE_KV.list({ prefix: 'invite:' });
+      for (const k of invites.keys) {
+        const rec2 = await kvGet(env, k.name);
+        if (!rec2 || rec2.eventId) continue; // already new-style
+        const evId = eventId(rec2.date || date, recurrence.hour, 'r');
+        report.push(`invite ${k.name.slice(7, 40)}... -> {chatId, eventId:${evId}}`);
+        if (!dry) await kvPut(env, k.name, { chatId, eventId: evId, key: rec2.key });
+      }
+
+      // Standby pool becomes per-group.
+      const oldStandby = await kvGet(env, 'standby');
+      if (oldStandby && oldStandby.length) {
+        report.push(`standby -> standby:${chatId} (${oldStandby.length} people)`);
+        if (!dry) await kvPut(env, `standby:${chatId}`, oldStandby);
+      }
+
+      report.push(dry ? 'DRY RUN — nothing written.' : 'Migrated. Legacy keys left in place for rollback.');
+      return new Response(report.join('\n') + '\n', {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }
+
     // --- Testing: manually fire a scheduled slot ---
     // GET /run?slot=rollcall&key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/run') {
@@ -1784,12 +2079,20 @@ export default {
         return new Response('forbidden', { status: 403 });
       }
       const slot = url.searchParams.get('slot');
-      const valid = activeSlots().map((s) => s.id);
+      const valid = ['remind-3d', 'remind-1d', 'lastcall', 'final'];
       if (!valid.includes(slot)) {
         return new Response(`bad slot; use one of: ${valid.join(', ')}`, { status: 400 });
       }
-      await runSlot(env, slot, new Date());
-      return new Response(`ran slot: ${slot}`, { status: 200 });
+      const group = url.searchParams.get('chat')
+        ? await getGroup(env, Number(url.searchParams.get('chat')))
+        : await defaultGroup(env);
+      if (!group) return new Response('no group', { status: 404 });
+      const event = url.searchParams.get('event')
+        ? await getEvent(env, group.chatId, url.searchParams.get('event'))
+        : await soonestEvent(env, group);
+      if (!event) return new Response('no event', { status: 404 });
+      await runSlot(env, group, event, slot);
+      return new Response(`ran slot: ${slot} for ${event.id}`, { status: 200 });
     }
 
     // --- Testing: wipe the current week's roster ---
@@ -1801,22 +2104,27 @@ export default {
       if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
-      const date = activeGameDate(new Date());
-      const week = await getWeek(env, date);
+      const group = await defaultGroup(env);
+      if (!group) return new Response('no group', { status: 404 });
+      const week = url.searchParams.get('event')
+        ? await getEvent(env, group.chatId, url.searchParams.get('event'))
+        : await soonestEvent(env, group);
+      if (!week) return new Response('no event', { status: 404 });
       week.phase = 'open';
       week.players = [];
-      await saveWeek(env, week);
-      // Reflect the wipe in the live roster message if a chat is bound.
-      const chatConf = await kvGet(env, 'chat');
-      if (chatConf) await refreshRoster(env, chatConf.chatId, week);
-      return new Response(`reset week: ${date}`, { status: 200 });
+      await saveEvent(env, week);
+      await refreshRoster(env, sendTarget(group), week);
+      await saveEvent(env, week);
+      return new Response(`reset event: ${week.id}`, { status: 200 });
     }
 
     // Public web sign-up page — shares the Telegram roster
     if (url.pathname === '/signup') {
-      const chatConf = await kvGet(env, 'chat');
-      if (!chatConf) return new Response('Bot not set up yet.', { status: 503 });
-      const week = await getWeek(env, activeGameDate(new Date()));
+      const group = await defaultGroup(env);
+      if (!group) return new Response('Bot not set up yet.', { status: 503 });
+      const chatConf = { chatId: sendTarget(group) };
+      const week = await soonestEvent(env, group);
+      if (!week) return new Response('No upcoming game.', { status: 404 });
 
       if (request.method === 'POST') {
         const form = await request.formData();
@@ -1831,8 +2139,7 @@ export default {
           if (!tgUser) {
             return new Response('Could not verify your Telegram session.', { status: 403 });
           }
-          const groupId = await liveGroupId(env, chatConf.chatId);
-          const viewer = { id: tgUser.id, initData, isAdmin: await isGroupAdmin(env, groupId, tgUser.id) };
+          const viewer = { id: tgUser.id, initData, isAdmin: await isGroupAdmin(env, group.chatId, tgUser.id) };
           const from = {
             id: tgUser.id,
             first_name: tgUser.first_name,
@@ -1858,37 +2165,36 @@ export default {
             };
             week.players.push(guest);
             // Same one-use claim link the Telegram button mints.
-            viewer.inviteLink = await mintGuestInvite(env, groupId, week, guest);
+            viewer.inviteLink = await mintGuestInvite(env, group, week, guest);
             note = `Added ${label}.`;
             announce = `➕ <b>${esc(who)}</b> added <b>${esc(label)}</b>.`;
           } else if (action === 'settings') {
             if (!viewer.isAdmin) {
               note = 'Only group admins can change the event details.';
             } else {
-              const next = (await kvGet(env, 'settings')) || {};
               const loc = (form.get('location') || '').toString().trim().slice(0, 60);
               const mapUrl = (form.get('mapUrl') || '').toString().trim().slice(0, 300);
               const label = (form.get('label') || '').toString().trim().slice(0, 20);
               const courts = parseInt((form.get('courts') || '').toString(), 10);
-              if (loc) next.location = loc;
-              next.mapUrl = mapUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
+              if (loc) group.settings.location = loc;
+              group.settings.mapUrl = mapUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
               if (label) {
                 const h = parseHour(label);
                 if (h === null) {
                   note = 'Could not read that time — try something like "6:00 AM".';
-                } else {
-                  next.label = label;
-                  next.hour = h;
+                } else if (group.recurrence) {
+                  group.recurrence.label = label;
+                  group.recurrence.hour = h;
                 }
               }
-              if (!Number.isNaN(courts) && courts >= 1 && courts <= 12) next.courts = courts;
+              if (!Number.isNaN(courts) && courts >= 1 && courts <= 12) group.settings.courts = courts;
               const perCourt = parseInt((form.get('perCourt') || '').toString(), 10);
-              if (!Number.isNaN(perCourt) && perCourt >= 2 && perCourt <= 8) next.perCourt = perCourt;
+              if (!Number.isNaN(perCourt) && perCourt >= 2 && perCourt <= 8) group.settings.perCourt = perCourt;
               if (!note) {
-                await kvPut(env, 'settings', next);
-                Object.assign(CONFIG.game, next);
+                await saveGroup(env, group);
+                await applyGroupSettingsToRecurring(env, group, week);
                 note = 'Event details updated.';
-                announce = `📍 Now at <b>${esc(CONFIG.game.location)}</b>, ${esc(CONFIG.game.label)}.`;
+                announce = `📍 Now at <b>${esc(group.settings.location)}</b>, ${esc(week.label)}.`;
               }
             }
           } else if (action === 'rename') {
@@ -1951,7 +2257,7 @@ export default {
             await notifyPromotions(env, chatConf.chatId, week, computePromotions(before, week));
           }
           if (['in', 'out', 'guest', 'dropguest', 'rename', 'settings'].includes(action)) {
-            await saveWeek(env, week);
+            await saveEvent(env, week);
             await postChange(env, chatConf.chatId, week, announce ? `${announce}\n${headcountLine(week)}` : null);
           }
           return new Response(signupPageHtml(week, note, viewer), {
@@ -1974,9 +2280,13 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(applySettings(env).then(() => handleScheduled(env)));
+    ctx.waitUntil(handleScheduled(env));
   },
 };
 
 // Exported for tests.
-export { groupPlayersIntoCourts, rosterText, describeCascade, activeGameDate, localParts, lastCallState, activeSlots, eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine, CONFIG };
+export {
+  groupPlayersIntoCourts, rosterText, describeCascade, localParts, lastCallState,
+  eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine,
+  nextOccurrence, eventId, newEvent, CONFIG,
+};

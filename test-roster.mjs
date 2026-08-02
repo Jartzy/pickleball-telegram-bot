@@ -3,8 +3,8 @@
 // never global config — so tests construct full event shapes via ev().
 import {
   groupPlayersIntoCourts, rosterText, describeCascade, lastCallState,
-  activeSlots, eventSlots, addDays, maxPlayers, isFull, joinOutcome,
-  headcountLine, CONFIG,
+  eventSlots, addDays, maxPlayers, isFull, joinOutcome,
+  headcountLine, nextOccurrence, eventId, newEvent,
 } from './worker.js';
 
 const SIZE = 4;
@@ -157,14 +157,34 @@ check('addDays basic', addDays('2026-07-30', -3) === '2026-07-27');
 check('addDays month boundary', addDays('2026-08-01', -2) === '2026-07-30');
 check('addDays year boundary', addDays('2026-01-01', -1) === '2025-12-31');
 
-console.log('\n== legacy global schedule (until Phase 2 cutover) ==');
+console.log('\n== recurrence: nextOccurrence ==');
 {
-  const ids = activeSlots().map((s) => s.id);
-  check('five slots', ids.length === 5, ids.join(','));
-  const final = activeSlots().find((s) => s.id === 'final');
-  check('final is one hour before the game', final.hour === (CONFIG.game.hour + 23) % 24, String(final.hour));
-  const open = activeSlots().find((s) => s.id === 'open');
-  check('open is after the game has rolled over', open.hour === (CONFIG.game.hour + 2) % 24, String(open.hour));
+  // 2026-08-02 is a Sunday. Use fixed UTC instants; recurrence math is Pacific.
+  const thuRec = { weekdays: ['Thu'], hour: 6, label: '6:00 AM' };
+  const sunAM = new Date('2026-08-02T17:00:00Z'); // Sun 10am PDT
+  check('Thu recurrence from Sunday -> next Thursday', nextOccurrence(thuRec, sunAM) === '2026-08-06');
+  const thuBefore = new Date('2026-08-06T12:30:00Z'); // Thu 5:30am PDT (before start)
+  check('game day before start -> same day', nextOccurrence(thuRec, thuBefore) === '2026-08-06');
+  const thuAfter = new Date('2026-08-06T15:00:00Z'); // Thu 8am PDT (start+1h passed)
+  check('game day after start+1h -> rolls a week', nextOccurrence(thuRec, thuAfter) === '2026-08-13');
+
+  const singlesRec = { weekdays: ['Sun', 'Mon', 'Tue'], hour: 5, label: '5:00 AM' };
+  const sat = new Date('2026-08-01T17:00:00Z'); // Sat 10am PDT
+  check('multi-day recurrence picks soonest (Sun)', nextOccurrence(singlesRec, sat) === '2026-08-02');
+  const sunLate = new Date('2026-08-02T14:00:00Z'); // Sun 7am PDT (5am game rolled)
+  check('after Sun game rolls to Mon', nextOccurrence(singlesRec, sunLate) === '2026-08-03');
+}
+
+console.log('\n== event identity ==');
+{
+  check('recurring id embeds date+hour', eventId('2026-08-06', 6, 'r') === '2026-08-06T06:r');
+  const g = { chatId: -1, settings: { location: 'X', mapUrl: 'u', courts: 4, perCourt: 4 } };
+  const e = newEvent(g, { date: '2026-08-06', hour: 6, label: '6:00 AM', sfx: 'r', kind: 'recurring' });
+  check('newEvent inherits group settings', e.location === 'X' && e.perCourt === 4 && e.chatId === -1);
+  check('newEvent starts open/active/empty', e.phase === 'open' && e.status === 'active' && e.players.length === 0);
+  // KV keys sort chronologically because the id starts with the date.
+  const a = eventId('2026-08-06', 6, 'r'), b = eventId('2026-08-09', 9, 'ab12');
+  check('event ids sort by date', a < b);
 }
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURES'}\n`);
