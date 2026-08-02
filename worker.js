@@ -333,6 +333,15 @@ async function resolveGroupForChat(env, chatId) {
   return legacyAutoMigrate(env, chatId);
 }
 
+/** Groups this user has interacted with — powers pickers, no Telegram calls. */
+async function rememberMembership(env, userId, chatId) {
+  const list = (await kvGet(env, `member:${userId}`)) || [];
+  if (!list.includes(chatId)) {
+    list.push(chatId);
+    await kvPut(env, `member:${userId}`, list);
+  }
+}
+
 /** Where this group's messages go (the DM while test mode is on). */
 function sendTarget(group) {
   return group.testRedirect || group.chatId;
@@ -1296,6 +1305,19 @@ async function handleCallback(env, cb) {
     return answer('Updated.');
   }
 
+  if (cb.data.startsWith('tm:')) {
+    const g = await getGroup(env, Number(cb.data.slice(3)));
+    if (!g || !(await isGroupAdmin(env, g.chatId, from.id))) return answer('Not your group.', true);
+    g.testRedirect = cbChatId;
+    await saveGroup(env, g);
+    await tg(env, 'sendMessage', {
+      chat_id: cbChatId,
+      text: `🧪 <b>Test mode on</b> for <b>${esc(g.title || g.chatId)}</b>. Send /livemode when you're done.`,
+      parse_mode: 'HTML',
+    });
+    return answer('Test mode on.');
+  }
+
   // Roster taps: find the group this chat belongs to. Taps in a DM (guest
   // roll-call cards, test mode) fall back to the caller's group.
   let group = await resolveGroupForChat(env, cbChatId);
@@ -1468,7 +1490,16 @@ async function handleCommand(env, msg) {
     const mine = [];
     for (const g of groups) if (await isGroupAdmin(env, g.chatId, from.id)) mine.push(g);
     if (!mine.length) return say('No group where you are an admin — run /setup inside your group first.');
-    const g = mine[0]; // one group today; a picker arrives with multi-group
+    if (mine.length > 1) {
+      return say('Which group?', {
+        reply_markup: {
+          inline_keyboard: mine.map((x) => [
+            { text: x.title || String(x.chatId), callback_data: `tm:${x.chatId}` },
+          ]),
+        },
+      });
+    }
+    const g = mine[0];
     g.testRedirect = chatId;
     await saveGroup(env, g);
     const week = await soonestEvent(env, g);
@@ -1541,6 +1572,7 @@ async function handleCommand(env, msg) {
 
   const group = await resolveGroupForChat(env, chatId);
   if (!group) return; // not a bound group (or its test DM) — stay silent
+  await rememberMembership(env, from.id, group.chatId);
 
   const chatConf = { chatId: sendTarget(group) };
   const week = await soonestEvent(env, group);
@@ -1587,6 +1619,38 @@ async function handleCommand(env, msg) {
     return say(`📅 ${fmtGameDate(week.date)}, ${week.label} at ${esc(week.location)}`, {
       reply_markup: { inline_keyboard: calendarButtons(week) },
     });
+  }
+
+  if (cmd === '/setdays' || cmd === '/setpercourt') {
+    if (msg.chat.type !== 'private') {
+      const m = await tg(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
+      const st = m.ok ? m.result.status : 'unknown';
+      if (st !== 'creator' && st !== 'administrator') return say('Admins only.');
+    }
+    const value = args.join(' ').trim();
+    if (cmd === '/setdays') {
+      const VALID = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const days = value
+        .split(/[\s,]+/)
+        .map((d) => d.slice(0, 1).toUpperCase() + d.slice(1, 3).toLowerCase())
+        .filter((d) => VALID.includes(d));
+      if (!days.length) return say('Try: /setdays Sun Mon Tue');
+      group.recurrence = group.recurrence || { ...DEFAULT_RECURRENCE };
+      group.recurrence.weekdays = days;
+      await saveGroup(env, group);
+      return say(`✅ Game days: every <b>${days.join('/')}</b> at ${esc(group.recurrence.label)}.`);
+    }
+    const pc = parseInt(value, 10);
+    if (Number.isNaN(pc) || pc < 2 || pc > 8) return say('Try: /setpercourt 2 (singles) or 4 (doubles)');
+    group.settings.perCourt = pc;
+    await saveGroup(env, group);
+    const updated = await applyGroupSettingsToRecurring(env, group, week);
+    await say(`✅ ${pc} per court${pc === 2 ? ' — singles' : pc === 4 ? ' — doubles' : ''}.`);
+    if (updated) {
+      await refreshRoster(env, sendTarget(group), updated, { repost: true });
+      await saveEvent(env, updated);
+    }
+    return;
   }
 
   if (cmd === '/setlocation' || cmd === '/settime' || cmd === '/setcourts') {
@@ -1706,6 +1770,7 @@ async function handleCommand(env, msg) {
         '/unguest Name — remove your guest',
         '/standby — get pinged when late spots open',
         '/status — repost the live roster',
+        '/setdays /settime /setlocation /setcourts /setpercourt — admin: event settings',
         '',
         group.recurrence
           ? `Game: every ${group.recurrence.weekdays.join('/')} ${group.recurrence.label} Pacific. Reminders Mon + 2 days out, last call the evening before, final roster an hour before.`
