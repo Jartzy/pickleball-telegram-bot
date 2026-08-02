@@ -71,6 +71,33 @@ const CONFIG = {
   // Slot times are derived from the game time — see activeSlots().
 };
 
+/** dateStr +/- n days, stable across DST because it works in pure dates. */
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d + n, 12));
+  return t.toISOString().slice(0, 10);
+}
+
+/**
+ * Per-event reminder moments (absolute local date+time). Replaces the global
+ * weekday cadence in Phase 2: remind-3d/1d at 8am, last call the evening
+ * before, final an hour before start (midnight-safe).
+ */
+function eventSlots(event) {
+  const finalOnPrevDay = event.hour === 0;
+  return [
+    { id: 'remind-3d', date: addDays(event.date, -3), hour: 8, minute: 0 },
+    { id: 'remind-1d', date: addDays(event.date, -1), hour: 8, minute: 0 },
+    { id: 'lastcall', date: addDays(event.date, -1), hour: 19, minute: 0 },
+    {
+      id: 'final',
+      date: finalOnPrevDay ? addDays(event.date, -1) : event.date,
+      hour: (event.hour + 23) % 24,
+      minute: 0,
+    },
+  ];
+}
+
 /**
  * Automation moments, in local time. Derived from the game time so moving the
  * game (e.g. to 8am) moves the final roster and the re-open with it.
@@ -157,8 +184,8 @@ function fmtGameDate(dateStr) {
 // COURT LOGIC — strict blocks of 4 (same math as documented in the header)
 // ============================================================================
 
-function groupPlayersIntoCourts(players) {
-  const size = CONFIG.playersPerCourt;
+function groupPlayersIntoCourts(players, perCourt) {
+  const size = perCourt || CONFIG.playersPerCourt;
   const courts = [];
   for (let start = 0; start < players.length; start += size) {
     const block = players.slice(start, start + size);
@@ -231,13 +258,13 @@ function icsStamp(date) {
 
 /** Google Calendar prefills via URL; Apple/Outlook take the .ics file. */
 function calendarButtons(week) {
-  const start = utcForLocal(week.date, CONFIG.game.hour);
+  const start = utcForLocal(week.date, week.hour);
   const end = new Date(start.getTime() + 2 * 3600 * 1000);
   const g =
     'https://calendar.google.com/calendar/render?action=TEMPLATE' +
     `&text=${encodeURIComponent('🏓 Pickleball')}` +
     `&dates=${icsStamp(start)}/${icsStamp(end)}` +
-    `&location=${encodeURIComponent(CONFIG.game.location)}` +
+    `&location=${encodeURIComponent(week.location)}` +
     `&details=${encodeURIComponent(`Roster: ${CONFIG.miniAppUrl || CONFIG.webUrl}`)}`;
   return [
     [
@@ -264,14 +291,24 @@ async function applySettings(env) {
 }
 
 async function getWeek(env, date) {
-  return (
-    (await kvGet(env, `week:${date}`)) || {
-      date,
-      phase: 'open', // open -> rollcall -> urgent (post-cutoff) -> final
-      players: [], // [{ key, name, id?, guestOf?, guestOfName? }] in sign-up order
-      msgId: null, // live roster message to edit
-    }
-  );
+  const stored = (await kvGet(env, `week:${date}`)) || {
+    date,
+    phase: 'open', // open -> rollcall -> urgent (post-cutoff) -> final
+    players: [], // [{ key, name, id?, guestOf?, guestOfName? }] in sign-up order
+    msgId: null, // live roster message to edit
+  };
+  // Compat shim: every consumer reads event fields off this object instead of
+  // global config, so per-event settings become possible without touching them
+  // again. Stored per-event values (future) win over the group defaults.
+  return {
+    hour: CONFIG.game.hour,
+    label: CONFIG.game.label,
+    location: CONFIG.game.location,
+    mapUrl: CONFIG.game.mapUrl,
+    courts: CONFIG.game.courts,
+    perCourt: CONFIG.playersPerCourt,
+    ...stored,
+  };
 }
 
 async function saveWeek(env, week) {
@@ -304,7 +341,7 @@ async function tg(env, method, params) {
  */
 function joinOutcome(week) {
   const n = week.players.length;
-  const size = CONFIG.playersPerCourt;
+  const size = week.perCourt;
   const court = Math.floor(n / size) + 1;
   const needAfter = size - ((n % size) + 1);
   return { court, needAfter, fills: needAfter === 0 };
@@ -334,11 +371,11 @@ function rosterKeyboard(week) {
 // ============================================================================
 
 function rosterText(week) {
-  const courts = groupPlayersIntoCourts(week.players);
+  const courts = groupPlayersIntoCourts(week.players, week.perCourt);
   const lines = [];
 
-  lines.push(`🏓 <b>Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</b>`);
-  lines.push(`📍 <a href="${CONFIG.game.mapUrl}">${CONFIG.game.location}</a> · ${CONFIG.game.courts} courts`);
+  lines.push(`🏓 <b>Pickleball — ${fmtGameDate(week.date)}, ${week.label}</b>`);
+  lines.push(`📍 <a href="${week.mapUrl}">${week.location}</a> · ${week.courts} courts`);
   if (week.phase === 'final') lines.push('🔒 <b>FINAL ROSTER</b>');
   lines.push('');
 
@@ -353,7 +390,7 @@ function rosterText(week) {
       lines.push(`⏳ <b>Waitlist / Filling Court ${court.courtNumber}</b>`);
     }
     court.players.forEach((player, idx) => {
-      const pos = (court.courtNumber - 1) * CONFIG.playersPerCourt + idx + 1;
+      const pos = (court.courtNumber - 1) * week.perCourt + idx + 1;
       lines.push(`  ${pos}. ${displayName(player)}`);
     });
     if (!court.isConfirmed) {
@@ -410,11 +447,11 @@ async function verifyInitData(env, initData) {
 }
 
 function signupPageHtml(week, done, viewer = null) {
-  const courts = groupPlayersIntoCourts(week.players);
+  const courts = groupPlayersIntoCourts(week.players, week.perCourt);
   let b = '';
   if (done) b += `<p class="msg">${esc(done)}</p>`;
-  b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${CONFIG.game.label}</h1>`;
-  b += `<p class="loc">📍 <a href="${CONFIG.game.mapUrl}" target="_blank" rel="noopener">${esc(CONFIG.game.location)}</a> · ${CONFIG.game.courts} courts</p>`;
+  b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${week.label}</h1>`;
+  b += `<p class="loc">📍 <a href="${week.mapUrl}" target="_blank" rel="noopener">${esc(week.location)}</a> · ${week.courts} courts</p>`;
   if (courts.length === 0) b += `<p><i>Nobody signed up yet — be the first!</i></p>`;
   for (const c of courts) {
     b += c.isConfirmed
@@ -449,12 +486,12 @@ function signupPageHtml(week, done, viewer = null) {
     b += `<form method="POST" action="/signup" class="rename">
       <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
       <label>Event settings</label>
-      <input name="location" value="${esc(CONFIG.game.location)}" placeholder="Location" maxlength="60"/>
-      <input name="mapUrl" value="${esc(CONFIG.game.mapUrl)}" placeholder="Map link" maxlength="300"/>
-      <input name="label" value="${esc(CONFIG.game.label)}" placeholder="Time, e.g. 6:00 AM" maxlength="20"/>
-      <input name="courts" value="${CONFIG.game.courts}" placeholder="Courts" type="number" min="1" max="12"/>
-      <input name="perCourt" value="${CONFIG.playersPerCourt}" placeholder="Players per court" type="number" min="2" max="8"/>
-      <p class="fine">${CONFIG.game.courts} courts × ${CONFIG.playersPerCourt} = ${maxPlayers()} spots. Minimum to play: ${CONFIG.playersPerCourt}.</p>
+      <input name="location" value="${esc(week.location)}" placeholder="Location" maxlength="60"/>
+      <input name="mapUrl" value="${esc(week.mapUrl)}" placeholder="Map link" maxlength="300"/>
+      <input name="label" value="${esc(week.label)}" placeholder="Time, e.g. 6:00 AM" maxlength="20"/>
+      <input name="courts" value="${week.courts}" placeholder="Courts" type="number" min="1" max="12"/>
+      <input name="perCourt" value="${week.perCourt}" placeholder="Players per court" type="number" min="2" max="8"/>
+      <p class="fine">${week.courts} courts × ${week.perCourt} = ${maxPlayers(week)} spots. Minimum to play: ${week.perCourt}.</p>
       <button name="action" value="settings" class="guest wide">💾 Save event details</button>
       <p class="fine">Changing the time also moves the reminders and the calendar invite.</p>
     </form>`;
@@ -485,7 +522,7 @@ function signupPageHtml(week, done, viewer = null) {
       <p>Send your guest this link — it's unique to them, works once, and adds them to the group in their own name:</p>
       <p class="snippet">${esc(viewer && viewer.inviteLink ? viewer.inviteLink : CONFIG.telegramInviteUrl)}</p>
       <p>Paste this with it:</p>
-      <p class="snippet">Pickleball ${esc(fmtGameDate(week.date))} at ${esc(CONFIG.game.label)}, ${esc(CONFIG.game.location)}. Roster: ${CONFIG.webUrl}</p>
+      <p class="snippet">Pickleball ${esc(fmtGameDate(week.date))} at ${esc(week.label)}, ${esc(week.location)}. Roster: ${CONFIG.webUrl}</p>
     </div>`;
   }
   if (viewer) {
@@ -514,7 +551,7 @@ function signupPageHtml(week, done, viewer = null) {
       <h2>${full ? '🚫 All courts are full this week' : '🏓 Want to play?'}</h2>
       <p>${
         full
-          ? `All ${CONFIG.game.courts} courts are booked. Join the group anyway — spots open up when people drop out.`
+          ? `All ${week.courts} courts are booked. Join the group anyway — spots open up when people drop out.`
           : 'Sign-ups, roll call and last-minute openings all happen in our Telegram group. Join and you can claim a spot in one tap.'
       }</p>
       <p class="ctas">
@@ -657,7 +694,7 @@ function nextGuestLabel(week, sponsorName) {
  * this — otherwise the group never learns the headcount moved.
  */
 function headcountLine(week) {
-  const courts = groupPlayersIntoCourts(week.players);
+  const courts = groupPlayersIntoCourts(week.players, week.perCourt);
   const confirmed = courts.filter((c) => c.isConfirmed).length;
   const partial = courts.find((c) => !c.isConfirmed);
   let s = `👥 ${week.players.length} in`;
@@ -800,10 +837,11 @@ async function handleChatMember(env, upd) {
   // Link from a game that has already happened: they're in the group, but
   // there's no spot to claim. Welcome them and point at the live roster.
   if (rec.date !== currentDate) {
+    const nextWeek = await getWeek(env, currentDate);
     await dmUser(
       env,
       user.id,
-      `👋 Welcome! That invite was for ${fmtGameDate(rec.date)}, which has already been played.\nThe next game is <b>${fmtGameDate(currentDate)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)} — tap ✅ I'm in on the roster to grab a spot.`
+      `👋 Welcome! That invite was for ${fmtGameDate(rec.date)}, which has already been played.\nThe next game is <b>${fmtGameDate(currentDate)}, ${nextWeek.label}</b> at ${esc(nextWeek.location)} — tap ✅ I'm in on the roster to grab a spot.`
     );
     return;
   }
@@ -817,7 +855,7 @@ async function handleChatMember(env, upd) {
     await dmUser(
       env,
       user.id,
-      `👋 Welcome! The spot you were invited to has since been given up, but you're in the group now.\n<b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)} — tap ✅ I'm in on the roster to take a spot.`
+      `👋 Welcome! The spot you were invited to has since been given up, but you're in the group now.\n<b>${fmtGameDate(week.date)}, ${week.label}</b> at ${esc(week.location)} — tap ✅ I'm in on the roster to take a spot.`
     );
     return;
   }
@@ -852,7 +890,7 @@ async function handleChatMember(env, upd) {
   await dmUser(
     env,
     user.id,
-    `👋 Welcome! You're on the roster for <b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)}.`,
+    `👋 Welcome! You're on the roster for <b>${fmtGameDate(week.date)}, ${week.label}</b> at ${esc(week.location)}.`,
     { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
   );
 }
@@ -881,22 +919,22 @@ async function announceWeb(env, chatId, week, line) {
  * fall through to "we're set".
  */
 function lastCallState(week) {
-  if (week.players.length < CONFIG.playersPerCourt) return 'short';
-  return groupPlayersIntoCourts(week.players).some((c) => !c.isConfirmed) ? 'recruit' : 'set';
+  if (week.players.length < week.perCourt) return 'short';
+  return groupPlayersIntoCourts(week.players, week.perCourt).some((c) => !c.isConfirmed) ? 'recruit' : 'set';
 }
 
 /** Hard ceiling on sign-ups: every court at the venue, full. */
-function maxPlayers() {
-  return CONFIG.game.courts * CONFIG.playersPerCourt;
+function maxPlayers(week) {
+  return week.courts * week.perCourt;
 }
 
 function isFull(week) {
-  return week.players.length >= maxPlayers();
+  return week.players.length >= maxPlayers(week);
 }
 
 /** How many courts are currently full (4/4). */
-function confirmedCourtCount(players) {
-  return groupPlayersIntoCourts(players).filter((c) => c.isConfirmed).length;
+function confirmedCourtCount(players, perCourt) {
+  return groupPlayersIntoCourts(players, perCourt).filter((c) => c.isConfirmed).length;
 }
 
 /**
@@ -904,8 +942,8 @@ function confirmedCourtCount(players) {
  * moment the group actually needs to hear about it ("we need 1 more"),
  * regardless of which phase the week is in.
  */
-function brokeAConfirmedCourt(beforePlayers, afterPlayers) {
-  return confirmedCourtCount(afterPlayers) < confirmedCourtCount(beforePlayers);
+function brokeAConfirmedCourt(beforePlayers, afterPlayers, perCourt) {
+  return confirmedCourtCount(afterPlayers, perCourt) < confirmedCourtCount(beforePlayers, perCourt);
 }
 
 /** Removes a member and any guests they sponsored. Returns removed entries. */
@@ -926,13 +964,13 @@ function removeMember(week, userId) {
  */
 function computePromotions(beforePlayers, week) {
   const before = new Map();
-  beforePlayers.forEach((p, i) => before.set(p.key, Math.floor(i / CONFIG.playersPerCourt) + 1));
+  beforePlayers.forEach((p, i) => before.set(p.key, Math.floor(i / week.perCourt) + 1));
 
   const moved = [];
   week.players.forEach((p, i) => {
-    const court = Math.floor(i / CONFIG.playersPerCourt) + 1;
+    const court = Math.floor(i / week.perCourt) + 1;
     if (before.has(p.key) && before.get(p.key) > court) {
-      moved.push({ player: p, court, confirmed: groupPlayersIntoCourts(week.players)[court - 1]?.isConfirmed });
+      moved.push({ player: p, court, confirmed: groupPlayersIntoCourts(week.players, week.perCourt)[court - 1]?.isConfirmed });
     }
   });
   return moved;
@@ -940,7 +978,7 @@ function computePromotions(beforePlayers, week) {
 
 /** Players sitting beyond the last full court — i.e. the backfill bench. */
 function waitlistDepth(week) {
-  return Math.max(0, week.players.length - confirmedCourtCount(week.players) * CONFIG.playersPerCourt);
+  return Math.max(0, week.players.length - confirmedCourtCount(week.players, week.perCourt) * week.perCourt);
 }
 
 /**
@@ -968,7 +1006,7 @@ async function notifyPromotions(env, groupChatId, week, promotions) {
       env,
       groupChatId,
       { id: targetId, name: player.guestOfName || player.name, category: 'promo' },
-      `${headline}\n${fmtGameDate(week.date)}, ${CONFIG.game.label} · ${CONFIG.game.location}${tail}`,
+      `${headline}\n${fmtGameDate(week.date)}, ${week.label} · ${week.location}${tail}`,
       { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
     );
   }
@@ -982,7 +1020,7 @@ function describeCascade(beforePlayers, week, removedNames) {
   const lines = [`⚠️ <b>${esc(removedNames.join(', '))}</b> can no longer make it.`];
   for (const move of promoted) lines.push(`⬆️ ${esc(move)}`);
 
-  const courts = groupPlayersIntoCourts(week.players);
+  const courts = groupPlayersIntoCourts(week.players, week.perCourt);
   const partial = courts.find((c) => !c.isConfirmed);
   if (partial) {
     const n = partial.playersNeeded;
@@ -1014,7 +1052,7 @@ async function askSponsorsToConfirmGuests(env, week) {
     await dmUser(
       env,
       sponsorId,
-      `🌙 Pickleball tomorrow, ${CONFIG.game.label}.\n\nYou're bringing ${guests
+      `🌙 Pickleball tomorrow, ${week.label}.\n\nYou're bringing ${guests
         .map((g) => `<b>${esc(g.name)}</b>`)
         .join(' and ')}. Still good?\n\nIgnore this if nothing's changed.`,
       { reply_markup: { inline_keyboard: rows } },
@@ -1055,7 +1093,7 @@ async function offerGuestLinksAfterDrop(env, sponsorId, removed) {
 
 /** Recruiting push: mention partial-court members + standby pool, add Claim button. */
 async function sendRecruitingAlert(env, chatId, week, intro) {
-  const courts = groupPlayersIntoCourts(week.players);
+  const courts = groupPlayersIntoCourts(week.players, week.perCourt);
   const partial = courts.find((c) => !c.isConfirmed);
   if (!partial) return;
 
@@ -1156,7 +1194,7 @@ async function handleCallback(env, cb) {
     if (!week.players.some((p) => p.key === `u:${from.id}`)) {
       return answer("Tap \"I'm in\" first — guests are added under someone who's playing.", true);
     }
-    if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
+    if (isFull(week)) return answer(`All ${week.courts} courts are full (${maxPlayers(week)} players).`, true);
     // One tap holds the spot under a placeholder name — no typing, no command.
     const sponsor = fullName(from);
     const label = nextGuestLabel(week, sponsor);
@@ -1170,7 +1208,7 @@ async function handleCallback(env, cb) {
     await saveWeek(env, week); // persist the stored claim link
 
     const personal = link
-      ? `✅ Spot saved for your guest.\n\nSend them this:\n\n<i>Pickleball ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}. You're on the list — tap to join us: ${link}</i>\n\nThat link is just for them and works once. When they tap it they're in the group and the spot becomes theirs.`
+      ? `✅ Spot saved for your guest.\n\nSend them this:\n\n<i>Pickleball ${fmtGameDate(week.date)}, ${week.label} at ${esc(week.location)}. You're on the list — tap to join us: ${link}</i>\n\nThat link is just for them and works once. When they tap it they're in the group and the spot becomes theirs.`
       : `➕ Added <b>${esc(label)}</b>. I couldn't make an invite link though — check I'm an admin with "Invite Users via Link".`;
 
     // Instructions are for the sponsor only; the group just needs the count.
@@ -1210,19 +1248,19 @@ async function handleCallback(env, cb) {
   if (cb.data === 'in') {
     if (week.players.some((p) => p.key === `u:${from.id}`)) {
       const spot = week.players.findIndex((p) => p.key === `u:${from.id}`) + 1;
-      const c = Math.floor((spot - 1) / CONFIG.playersPerCourt) + 1;
+      const c = Math.floor((spot - 1) / week.perCourt) + 1;
       return answer(`You're already in — #${spot}, Court ${c}. Tap "Can't make it" to drop out.`, true);
     }
-    if (isFull(week)) return answer(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`, true);
+    if (isFull(week)) return answer(`All ${week.courts} courts are full (${maxPlayers(week)} players).`, true);
     addMember(week, from);
     await saveWeek(env, week);
     const pos = week.players.length;
-    const court = Math.floor((pos - 1) / CONFIG.playersPerCourt) + 1;
+    const court = Math.floor((pos - 1) / week.perCourt) + 1;
     await postChange(env, chatConf.chatId, week, `✅ <b>${esc(fullName(from))}</b> is in.\n${headcountLine(week)}`);
     await dmUser(
       env,
       from.id,
-      `🏓 You're in for <b>${fmtGameDate(week.date)}, ${CONFIG.game.label}</b> at ${esc(CONFIG.game.location)}.`,
+      `🏓 You're in for <b>${fmtGameDate(week.date)}, ${week.label}</b> at ${esc(week.location)}.`,
       { reply_markup: { inline_keyboard: calendarButtons(week) } },
       'reminders'
     );
@@ -1247,7 +1285,7 @@ async function handleCallback(env, cb) {
     );
     await offerGuestLinksAfterDrop(env, from.id, removed);
     // Announce when a full court just broke, or any time after roll call.
-    if (brokeAConfirmedCourt(before, week.players) || week.phase === 'rollcall' || week.phase === 'urgent') {
+    if (brokeAConfirmedCourt(before, week.players, week.perCourt) || week.phase === 'rollcall' || week.phase === 'urgent') {
       await tg(env, 'sendMessage', {
         chat_id: chatConf.chatId,
         text: describeCascade(before, week, removed.map((r) => r.name)),
@@ -1356,7 +1394,7 @@ async function handleCommand(env, msg) {
     if (removed.length > 0) {
       await saveWeek(env, week);
       await refreshRoster(env, chatId, week);
-      if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players)) {
+      if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players, week.perCourt)) {
         await say(describeCascade(before, week, removed.map((r) => r.name)));
         await sendRecruitingAlert(env, chatId, week, null);
       }
@@ -1377,7 +1415,7 @@ async function handleCommand(env, msg) {
 
   if (cmd === '/calendar') {
     const week = await getWeek(env, activeGameDate(new Date()));
-    return say(`📅 ${fmtGameDate(week.date)}, ${CONFIG.game.label} at ${esc(CONFIG.game.location)}`, {
+    return say(`📅 ${fmtGameDate(week.date)}, ${week.label} at ${esc(week.location)}`, {
       reply_markup: { inline_keyboard: calendarButtons(week) },
     });
   }
@@ -1448,7 +1486,7 @@ async function handleCommand(env, msg) {
   if (cmd === '/guest') {
     const name = args.join(' ').trim();
     if (!name) return say('Usage: /guest FirstName — adds a guest under your name.');
-    if (isFull(week)) return say(`All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`);
+    if (isFull(week)) return say(`All ${week.courts} courts are full (${maxPlayers(week)} players).`);
     const key = `g:${from.id}:${name.toLowerCase()}`;
     if (findPlayer(week, key) !== -1) return say(`${esc(name)} is already on the roster.`);
     week.players.push({ key, name, guestOf: from.id, guestOfName: fullName(from) });
@@ -1465,7 +1503,7 @@ async function handleCommand(env, msg) {
     week.players.splice(idx, 1);
     await saveWeek(env, week);
     await refreshRoster(env, chatId, week);
-    if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players)) {
+    if (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players, week.perCourt)) {
       await say(describeCascade(before, week, [name]));
       await sendRecruitingAlert(env, chatId, week, null);
     }
@@ -1513,7 +1551,7 @@ async function runSlot(env, slotId, now) {
   if (!chatConf) return; // not set up yet
   const chatId = chatConf.chatId;
   const week = await getWeek(env, activeGameDate(now));
-  const label = `${fmtGameDate(week.date)}, ${CONFIG.game.label}`;
+  const label = `${fmtGameDate(week.date)}, ${week.label}`;
 
   if (slotId === 'open') {
     // Fires after this week's game, so activeGameDate has rolled to NEXT week.
@@ -1554,12 +1592,12 @@ async function runSlot(env, slotId, now) {
     await saveWeek(env, week);
     const state = lastCallState(week);
     if (state === 'short') {
-      const need = CONFIG.playersPerCourt - week.players.length;
+      const need = week.perCourt - week.players.length;
       await tg(env, 'sendMessage', {
         chat_id: chatId,
         text:
           week.players.length === 0
-            ? `🚨 <b>${label}</b> — nobody's signed up yet.\n\nWe need ${CONFIG.playersPerCourt} to play. If you're keen, say so tonight, otherwise it's off.`
+            ? `🚨 <b>${label}</b> — nobody's signed up yet.\n\nWe need ${week.perCourt} to play. If you're keen, say so tonight, otherwise it's off.`
             : `🚨 <b>${label}</b> — only ${week.players.length} of us so far, ${need} short of a court.\n\nGrab a mate or shout tonight, otherwise we'll call it off.`,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: rosterKeyboard(week).inline_keyboard },
@@ -1576,7 +1614,7 @@ async function runSlot(env, slotId, now) {
   }
 
   if (slotId === 'final') {
-    const size = CONFIG.playersPerCourt;
+    const size = week.perCourt;
     // Not enough for a single court: tell the people who signed up directly
     // rather than letting them turn up to nobody.
     if (week.players.length < size) {
@@ -1662,9 +1700,11 @@ export default {
 
     // --- Calendar file for the game (add-to-calendar links point here) ---
     if (url.pathname === '/event.ics') {
-      const date = (url.searchParams.get('date') || activeGameDate(new Date())).replace(/-/g, '');
-      const hh = String(CONFIG.game.hour).padStart(2, '0');
-      const endHh = String((CONFIG.game.hour + 2) % 24).padStart(2, '0');
+      const dateStr = url.searchParams.get('date') || activeGameDate(new Date());
+      const icsWeek = await getWeek(env, dateStr);
+      const date = dateStr.replace(/-/g, '');
+      const hh = String(icsWeek.hour).padStart(2, '0');
+      const endHh = String((icsWeek.hour + 2) % 24).padStart(2, '0');
       const ics = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
@@ -1676,7 +1716,7 @@ export default {
         `DTSTART;TZID=${CONFIG.timezone}:${date}T${hh}0000`,
         `DTEND;TZID=${CONFIG.timezone}:${date}T${endHh}0000`,
         'SUMMARY:🏓 Pickleball',
-        `LOCATION:${CONFIG.game.location}`,
+        `LOCATION:${icsWeek.location}`,
         `DESCRIPTION:Roster and sign-up: ${CONFIG.miniAppUrl || CONFIG.webUrl}`,
         'END:VEVENT',
         'END:VCALENDAR',
@@ -1803,9 +1843,9 @@ export default {
           let announce = '';
           const who = fullName(from);
           if (action === 'guest' && isFull(week)) {
-            note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+            note = `All ${week.courts} courts are full (${maxPlayers(week)} players).`;
           } else if (action === 'in' && isFull(week)) {
-            note = `All ${CONFIG.game.courts} courts are full (${maxPlayers()} players).`;
+            note = `All ${week.courts} courts are full (${maxPlayers(week)} players).`;
           } else if (action === 'guest' && !week.players.some((p) => p.key === `u:${tgUser.id}`)) {
             note = "Join first — guests are added under someone who's playing.";
           } else if (action === 'guest') {
@@ -1843,10 +1883,7 @@ export default {
               }
               if (!Number.isNaN(courts) && courts >= 1 && courts <= 12) next.courts = courts;
               const perCourt = parseInt((form.get('perCourt') || '').toString(), 10);
-              if (!Number.isNaN(perCourt) && perCourt >= 2 && perCourt <= 8) {
-                next.perCourt = perCourt;
-                CONFIG.playersPerCourt = perCourt;
-              }
+              if (!Number.isNaN(perCourt) && perCourt >= 2 && perCourt <= 8) next.perCourt = perCourt;
               if (!note) {
                 await kvPut(env, 'settings', next);
                 Object.assign(CONFIG.game, next);
@@ -1900,10 +1937,10 @@ export default {
             note = removed.length ? "You're out — thanks for the heads-up." : "You weren't on the roster.";
             if (removed.length) await offerGuestLinksAfterDrop(env, tgUser.id, removed);
             // describeCascade already announces below when it fires.
-            if (removed.length && week.phase === 'open' && !brokeAConfirmedCourt(before, week.players)) {
+            if (removed.length && week.phase === 'open' && !brokeAConfirmedCourt(before, week.players, week.perCourt)) {
               announce = `❌ <b>${esc(who)}</b> can no longer make it.`;
             }
-            if (removed.length && (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players))) {
+            if (removed.length && (week.phase !== 'open' || brokeAConfirmedCourt(before, week.players, week.perCourt))) {
               await tg(env, 'sendMessage', {
                 chat_id: chatConf.chatId,
                 text: describeCascade(before, week, removed.map((r) => r.name)),
@@ -1942,4 +1979,4 @@ export default {
 };
 
 // Exported for tests.
-export { groupPlayersIntoCourts, rosterText, describeCascade, activeGameDate, localParts, lastCallState, activeSlots, CONFIG };
+export { groupPlayersIntoCourts, rosterText, describeCascade, activeGameDate, localParts, lastCallState, activeSlots, eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine, CONFIG };
