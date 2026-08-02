@@ -978,6 +978,89 @@ function dmOptInUrl(payload = 'dm') {
   return `https://t.me/${CONFIG.botUsername}?start=${payload}`;
 }
 
+// ---------------------------------------------------------------------------
+// SMS (Twilio) — the notification channel for web-identity players, who have
+// a phone number instead of a Telegram account.
+// Secrets: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM. Until they're
+// set (A2P registration takes days), sends fail soft and log.
+// ---------------------------------------------------------------------------
+
+/** Telegram-HTML -> plain text an SMS can carry. */
+function smsText(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function sendSms(env, phone, html) {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_FROM) {
+    console.log('sendSms skipped: Twilio secrets not configured');
+    return false;
+  }
+  const body = new URLSearchParams({ To: phone, From: env.TWILIO_FROM, Body: smsText(html) });
+  const res = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    }
+  );
+  if (!res.ok) console.log(`twilio send failed: ${res.status} ${await res.text()}`);
+  return res.ok;
+}
+
+async function getWebUser(env, phone) {
+  return kvGet(env, `webuser:${phone}`);
+}
+
+/**
+ * Which private channel reaches this roster entry:
+ *   telegram — real member (u:) — or a guest, via their sponsor's Telegram
+ *   sms      — web-identity player (p:<phoneE164>)
+ *   null     — unreachable
+ */
+function channelFor(player) {
+  if (player.id || player.guestOf) return 'telegram';
+  if (player.key && player.key.startsWith('p:')) return 'sms';
+  return null;
+}
+
+/**
+ * One seam for every personal notice. Routes on identity kind and honours the
+ * person's per-category preferences on both channels; Telegram users without
+ * a DM opt-in fall back to a group @mention so nobody silently misses out.
+ */
+async function notifyUser(env, groupChatId, person, text, extra = {}, category = null) {
+  const channel = channelFor(person);
+  if (channel === 'sms') {
+    const phone = person.key.slice(2);
+    const rec = await getWebUser(env, phone);
+    if (rec && prefEnabled(rec, category)) {
+      if (await sendSms(env, phone, text)) return 'sms';
+    }
+    return 'skipped'; // no group fallback — an SMS user isn't in the chat
+  }
+  const tgId = person.id || person.guestOf;
+  if (!tgId) return 'skipped';
+  if (await dmUser(env, tgId, text, extra, category)) return 'dm';
+  await tg(env, 'sendMessage', {
+    chat_id: groupChatId,
+    text: `${mention({ id: tgId, name: person.guestOfName || person.name })} — ${text}`,
+    parse_mode: 'HTML',
+    ...extra,
+  });
+  return 'group';
+}
+
 /**
  * Tells one person something: privately when they've opted in, otherwise via a
  * group @mention so they still get pinged. Keeps personal chatter out of the
@@ -1196,9 +1279,7 @@ function waitlistDepth(week) {
 async function notifyPromotions(env, groupChatId, week, promotions) {
   const depth = waitlistDepth(week);
   for (const { player, court, confirmed } of promotions) {
-    // Guests have no Telegram identity — tell whoever is sponsoring them.
-    const targetId = player.id || player.guestOf;
-    if (!targetId) continue; // web-only signup: unreachable
+    if (!channelFor(player)) continue; // truly unreachable
     const aboutGuest = !player.id && player.guestOf;
 
     const headline = confirmed
@@ -1210,12 +1291,13 @@ async function notifyPromotions(env, groupChatId, week, promotions) {
         ? `\n\nJust so you know, there's nobody on the waitlist right now — if this spot opens up again the court would be short.`
         : '';
 
-    await notifyPlayer(
+    await notifyUser(
       env,
       groupChatId,
-      { id: targetId, name: player.guestOfName || player.name, category: 'promo' },
+      player,
       `${headline}\n${fmtGameDate(week.date)}, ${week.label} · ${week.location}${tail}`,
-      { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
+      { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } },
+      'promo'
     );
   }
 }
@@ -1454,10 +1536,9 @@ async function handleCallback(env, cb) {
       });
     }
     for (const pl of week.players) {
-      const targetId = pl.id || pl.guestOf;
-      if (!targetId || targetId === from.id) continue;
-      await notifyPlayer(env, chatConf.chatId, { id: targetId, name: pl.guestOfName || pl.name, category: 'reminders' },
-        `🗑 The pickup game on <b>${fmtGameDate(week.date)}, ${week.label}</b> was cancelled.`);
+      if ((pl.id || pl.guestOf) === from.id) continue;
+      await notifyUser(env, chatConf.chatId, pl,
+        `🗑 The pickup game on <b>${fmtGameDate(week.date)}, ${week.label}</b> was cancelled.`, {}, 'reminders');
     }
     return answer('Game cancelled.');
   }
@@ -2017,10 +2098,10 @@ async function runSlot(env, group, week, slotId) {
         parse_mode: 'HTML',
       });
       for (const p of week.players) {
-        if (!p.id) continue;
-        await dmUser(
+        await notifyUser(
           env,
-          p.id,
+          chatId,
+          p,
           `⚠️ Only ${week.players.length} signed up for <b>${label}</b> — ${short} short of a court.\n\nStill keen? Say so in the group now. Otherwise assume it's off this week.`,
           {},
           'reminders'
@@ -2302,6 +2383,27 @@ export default {
       });
     }
 
+    // --- Verify Twilio wiring: sends one real SMS to yourself ---
+    // GET /test-sms?key=SECRET&to=+15551234567
+    if (url.pathname === '/test-sms') {
+      if (!env.WEBHOOK_SECRET) return new Response('WEBHOOK_SECRET not set', { status: 503 });
+      if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const to = url.searchParams.get('to') || '';
+      if (!/^\+\d{8,15}$/.test(to)) {
+        return new Response('pass ?to=+1XXXXXXXXXX (E.164)', { status: 400 });
+      }
+      if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_FROM) {
+        return new Response(
+          'Twilio secrets missing. Set them with:\n  npx wrangler secret put TWILIO_ACCOUNT_SID\n  npx wrangler secret put TWILIO_AUTH_TOKEN\n  npx wrangler secret put TWILIO_FROM\n',
+          { status: 503 }
+        );
+      }
+      const ok = await sendSms(env, to, '🏓 Pickleball bot SMS test — you are wired up.');
+      return new Response(ok ? `sent to ${to}` : 'send failed — check worker logs', { status: ok ? 200 : 502 });
+    }
+
     // --- Testing: manually fire a scheduled slot ---
     // GET /run?slot=rollcall&key=YOUR_WEBHOOK_SECRET
     if (url.pathname === '/run') {
@@ -2521,5 +2623,6 @@ export default {
 export {
   groupPlayersIntoCourts, rosterText, describeCascade, localParts, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine,
-  nextOccurrence, eventId, newEvent, parsePropose, ensurePids, CONFIG,
+  nextOccurrence, eventId, newEvent, parsePropose, ensurePids, channelFor,
+  smsText, CONFIG,
 };

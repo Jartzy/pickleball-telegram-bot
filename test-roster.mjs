@@ -5,6 +5,7 @@ import {
   groupPlayersIntoCourts, rosterText, describeCascade, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome,
   headcountLine, nextOccurrence, eventId, newEvent, parsePropose, ensurePids,
+  channelFor, smsText,
 } from './worker.js';
 
 const SIZE = 4;
@@ -233,6 +234,22 @@ console.log('\n== proposed event shape ==');
   check('overrides beat group defaults', e.location === 'Fiesta' && e.perCourt === 2);
   check('roster credits proposer', rosterText(e).includes('proposed by John'));
   check('recurring roster has no proposer line', !rosterText(ev(2)).includes('proposed by'));
+}
+
+console.log('\n== notification routing (channelFor) ==');
+{
+  check('telegram member -> telegram', channelFor({ key: 'u:5', id: 5 }) === 'telegram');
+  check('guest -> telegram (via sponsor)', channelFor({ key: 'g:5:pal', guestOf: 5 }) === 'telegram');
+  check('web player -> sms', channelFor({ key: 'p:+15551234567' }) === 'sms');
+  check('unknown -> null', channelFor({ key: 'x:???' }) === null);
+}
+
+console.log('\n== smsText strips Telegram HTML ==');
+{
+  const out = smsText('🎉 A spot opened — <b>you&#x27;re</b> now on <b>Court 1</b>.\nThu, Aug 6 · Bob Baskin Park');
+  check('tags gone', !/[<>]/.test(out.replace(/&#x27;/, "'")), JSON.stringify(out));
+  check('content kept', out.includes('Court 1') && out.includes('Bob Baskin Park'));
+  check('entities decoded', smsText('A &amp; B &lt;ok&gt;') === 'A & B <ok>');
 }
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURES'}\n`);
