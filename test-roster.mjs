@@ -5,7 +5,7 @@ import {
   groupPlayersIntoCourts, rosterText, describeCascade, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome,
   headcountLine, nextOccurrence, eventId, newEvent, parsePropose, ensurePids,
-  channelFor, smsText,
+  channelFor, smsText, encodeStartParam, decodeStartParam,
 } from './worker.js';
 
 const SIZE = 4;
@@ -250,6 +250,16 @@ console.log('\n== smsText strips Telegram HTML ==');
   check('tags gone', !/[<>]/.test(out.replace(/&#x27;/, "'")), JSON.stringify(out));
   check('content kept', out.includes('Court 1') && out.includes('Bob Baskin Park'));
   check('entities decoded', smsText('A &amp; B &lt;ok&gt;') === 'A & B <ok>');
+}
+
+console.log('\n== Mini App deep-link payloads ==');
+{
+  const rid = eventId('2026-08-06', 6, 'r');
+  const pidId = eventId('2026-08-15', 9, 'ab12');
+  check('encode strips forbidden chars', /^[A-Za-z0-9_-]+$/.test(encodeStartParam(rid)), encodeStartParam(rid));
+  check('round-trip recurring', decodeStartParam(encodeStartParam(rid)) === rid);
+  check('round-trip proposal', decodeStartParam(encodeStartParam(pidId)) === pidId);
+  check('payload under 64 chars', encodeStartParam(pidId).length <= 64);
 }
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURES'}\n`);

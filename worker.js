@@ -351,6 +351,25 @@ function eventId(date, hour, sfx) {
   return `${date}T${String(hour).padStart(2, '0')}:${sfx}`;
 }
 
+/**
+ * Event ids ride in Mini App startapp payloads, which only allow
+ * [A-Za-z0-9_-]. Ids contain ':' (never '_'), so the swap is reversible.
+ */
+function encodeStartParam(id) {
+  return id.replaceAll(':', '_');
+}
+
+function decodeStartParam(payload) {
+  return payload.replaceAll('_', ':');
+}
+
+/** Mini App link that opens straight onto one event. */
+function miniAppEventUrl(eventId) {
+  const base = CONFIG.miniAppUrl || CONFIG.webUrl;
+  if (!CONFIG.miniAppUrl) return `${base}?event=${encodeURIComponent(eventId)}`;
+  return `${base}?startapp=${encodeStartParam(eventId)}`;
+}
+
 function shortId(len = 4) {
   let out = '';
   while (out.length < len) out += Math.random().toString(36).slice(2);
@@ -649,16 +668,31 @@ async function verifyInitData(env, initData) {
 
   try {
     const user = JSON.parse(params.get('user') || 'null');
-    return user && user.id ? user : null;
+    if (!user || !user.id) return null;
+    // start_param is inside the signed blob, so an event id carried this way
+    // is trustworthy (a forged one would break the HMAC).
+    user.startParam = params.get('start_param') || '';
+    return user;
   } catch {
     return null;
   }
 }
 
-function signupPageHtml(week, done, viewer = null) {
+function signupPageHtml(week, done, viewer = null, allEvents = []) {
   const courts = groupPlayersIntoCourts(week.players, week.perCourt);
+  const evField = `<input type="hidden" name="event" value="${esc(week.id || '')}"/>`;
   let b = '';
   if (done) b += `<p class="msg">${esc(done)}</p>`;
+  // Event picker: only when there is actually a choice.
+  if (allEvents.length > 1) {
+    b += `<p class="picker">${allEvents
+      .map((e) =>
+        e.id === week.id
+          ? `<span class="pick cur">${esc(fmtGameDate(e.date))} ${esc(e.label)}</span>`
+          : `<a class="pick" href="/signup?event=${encodeURIComponent(e.id)}">${esc(fmtGameDate(e.date))} ${esc(e.label)}</a>`
+      )
+      .join('')}</p>`;
+  }
   b += `<h1>🏓 Pickleball — ${fmtGameDate(week.date)}, ${week.label}</h1>`;
   b += `<p class="loc">📍 <a href="${week.mapUrl}" target="_blank" rel="noopener">${esc(week.location)}</a> · ${week.courts} courts</p>`;
   if (courts.length === 0) b += `<p><i>Nobody signed up yet — be the first!</i></p>`;
@@ -677,7 +711,7 @@ function signupPageHtml(week, done, viewer = null) {
       // A sponsor can drop each of their own guests individually.
       const mine = viewer && (p.guestOf === viewer.id || (viewer.isAdmin && p.key !== `u:${viewer.id}`));
       const drop = mine
-        ? `<form method="POST" action="/signup" class="x"><input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove">✕</button></form>`
+        ? `<form method="POST" action="/signup" class="x">${evField}<input type="hidden" name="initData" value="${esc(viewer.initData)}"/><input type="hidden" name="guestKey" value="${esc(p.key)}"/><button name="action" value="dropguest" class="xbtn" title="Remove">✕</button></form>`
         : '';
       const linkBit =
         mine && p.inviteLink
@@ -693,6 +727,7 @@ function signupPageHtml(week, done, viewer = null) {
   }
   if (viewer && viewer.isAdmin) {
     b += `<form method="POST" action="/signup" class="rename">
+      ${evField}
       <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
       <label>Event settings</label>
       <input name="location" value="${esc(week.location)}" placeholder="Location" maxlength="60"/>
@@ -712,6 +747,7 @@ function signupPageHtml(week, done, viewer = null) {
     );
     if (mineList.length) {
       b += `<form method="POST" action="/signup" class="rename">
+        ${evField}
         <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
         <label>Rename someone</label>
         <select name="guestKey">${mineList
@@ -739,6 +775,7 @@ function signupPageHtml(week, done, viewer = null) {
     // contextual to whether this person is already on the roster.
     const onRoster = week.players.some((p) => p.key === `u:${viewer.id}`);
     b += `<form method="POST" action="/signup" class="f">
+      ${evField}
       <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
       ${
         onRoster
@@ -746,6 +783,22 @@ function signupPageHtml(week, done, viewer = null) {
           : `<button name="action" value="in" class="in wide">${esc(joinLabel(week).replace('✅ ', ''))}</button>`
       }
       <button name="action" value="guest" class="guest wide">➕ Bring a guest</button>
+    </form>`;
+  }
+  b += `<p class="calrow">📅 Add to calendar: <a href="${CONFIG.calendarUrl}?event=${encodeURIComponent(week.id || '')}" target="_blank" rel="noopener">Apple / Outlook</a></p>`;
+  if (viewer) {
+    b += `<form method="POST" action="/signup" class="rename">
+      <input type="hidden" name="initData" value="${esc(viewer.initData)}"/>
+      <label>💡 Propose a pickup game</label>
+      <input name="pDay" placeholder="Day — e.g. Sat or 8/15" maxlength="12" required/>
+      <input name="pTime" placeholder="Time — e.g. 9:00 AM" maxlength="10" required/>
+      <input name="pLocation" placeholder="Location (blank = ${esc(week.location)})" maxlength="60"/>
+      <div class="btns">
+        <input name="pCourts" placeholder="Courts" type="number" min="1" max="12"/>
+        <input name="pPerCourt" placeholder="Per court" type="number" min="2" max="8"/>
+      </div>
+      <button name="action" value="propose" class="guest wide">💡 Propose it</button>
+      <p class="fine">Posts to the group with its own roster and reminders. You're automatically in.</p>
     </form>`;
   }
   // Someone inside the Mini App is already in Telegram — don't sell them on it.
@@ -809,6 +862,11 @@ function signupPageHtml(week, done, viewer = null) {
   .cta2{background:#16a34a;color:#fff}
   .fine{font-size:.8rem;color:#555;margin:0}
   .snippet{background:#fff;border:1px dashed #d6d3d1;border-radius:8px;padding:10px;font-size:.85rem;word-break:break-word}
+  .picker{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+  .pick{display:inline-block;padding:6px 10px;border-radius:16px;background:#e2e8f0;color:#111;text-decoration:none;font-size:.82rem}
+  .pick.cur{background:#16a34a;color:#fff;font-weight:600}
+  .calrow{font-size:.85rem;margin:8px 0}
+  .calrow a{color:#2563eb}
   </style></head><body${viewer ? ' data-tg="1"' : ''}>${b}
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script>
@@ -1182,7 +1240,7 @@ async function handleChatMember(env, upd) {
     env,
     user.id,
     `👋 Welcome! You're on the roster for <b>${fmtGameDate(week.date)}, ${week.label}</b> at ${esc(week.location)}.`,
-    { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } }
+    { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: miniAppEventUrl(week.id) }]] } }
   );
 }
 
@@ -1296,7 +1354,7 @@ async function notifyPromotions(env, groupChatId, week, promotions) {
       groupChatId,
       player,
       `${headline}\n${fmtGameDate(week.date)}, ${week.label} · ${week.location}${tail}`,
-      { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] } },
+      { reply_markup: { inline_keyboard: [[{ text: '🌐 Manage my spot', url: miniAppEventUrl(week.id) }]] } },
       'promo'
     );
   }
@@ -1859,7 +1917,7 @@ async function handleCommand(env, msg) {
   // Opens the Mini App (admin controls live in there for group admins).
   if (cmd === '/manage') {
     return say('Roster controls:', {
-      reply_markup: { inline_keyboard: [[{ text: '🛠 Open roster', url: CONFIG.miniAppUrl || CONFIG.webUrl }]] },
+      reply_markup: { inline_keyboard: [[{ text: '🛠 Open roster', url: miniAppEventUrl(week.id) }]] },
     });
   }
 
@@ -2215,9 +2273,11 @@ export default {
     if (url.pathname === '/event.ics') {
       const group = await defaultGroup(env);
       if (!group) return new Response('Bot not set up yet.', { status: 503 });
+      const wantId = url.searchParams.get('event');
       const wantDate = url.searchParams.get('date');
       const upcoming = await listUpcomingEvents(env, group.chatId);
       const icsWeek =
+        (wantId && (upcoming.find((e) => e.id === wantId) || (await getEvent(env, group.chatId, wantId)))) ||
         (wantDate && upcoming.find((e) => e.date === wantDate)) ||
         upcoming[0] ||
         (await soonestEvent(env, group));
@@ -2458,7 +2518,12 @@ export default {
       const group = await defaultGroup(env);
       if (!group) return new Response('Bot not set up yet.', { status: 503 });
       const chatConf = { chatId: sendTarget(group) };
-      const week = await soonestEvent(env, group);
+      const allEvents = await listUpcomingEvents(env, group.chatId);
+      const wantEvent = url.searchParams.get('event');
+      let week =
+        (wantEvent && allEvents.find((e) => e.id === wantEvent)) ||
+        allEvents[0] ||
+        (await soonestEvent(env, group));
       if (!week) return new Response('No upcoming game.', { status: 404 });
 
       if (request.method === 'POST') {
@@ -2474,7 +2539,26 @@ export default {
           if (!tgUser) {
             return new Response('Could not verify your Telegram session.', { status: 403 });
           }
-          const viewer = { id: tgUser.id, initData, isAdmin: await isGroupAdmin(env, group.chatId, tgUser.id) };
+          // Event context: an explicit form field wins, else the deep-link
+          // payload (signed inside initData, so it can't be forged).
+          const evWanted = (form.get('event') || '').toString() || (tgUser.startParam ? decodeStartParam(tgUser.startParam) : '');
+          if (evWanted) {
+            const chosen = allEvents.find((e) => e.id === evWanted) || (await getEvent(env, group.chatId, evWanted));
+            if (chosen && chosen.status === 'active' && chosen.phase !== 'done') week = chosen;
+          }
+          // SECURITY: initData proves who they are, not that they belong to
+          // this group. Anyone can open the Mini App link — verify membership
+          // before letting them touch the roster.
+          const m = await tg(env, 'getChatMember', { chat_id: group.chatId, user_id: tgUser.id });
+          const status = m.ok ? m.result.status : 'unknown';
+          const isMember = ['creator', 'administrator', 'member', 'restricted'].includes(status);
+          if (!isMember && action && action !== 'view') {
+            return new Response(signupPageHtml(week, 'Join the Telegram group first — then you can sign up here.', null, allEvents), {
+              headers: { 'content-type': 'text/html; charset=utf-8' },
+            });
+          }
+          const viewer = { id: tgUser.id, initData, isAdmin: ['creator', 'administrator'].includes(status) };
+          await rememberMembership(env, tgUser.id, group.chatId);
           const from = {
             id: tgUser.id,
             first_name: tgUser.first_name,
@@ -2484,7 +2568,45 @@ export default {
           let note = '';
           let announce = '';
           const who = fullName(from);
-          if (action === 'guest' && isFull(week)) {
+          if (action === 'propose') {
+            const parsed = parsePropose(`${(form.get('pDay') || '').toString().trim()} ${(form.get('pTime') || '').toString().trim()}`);
+            if (!parsed) {
+              note = 'Could not read that day/time — try "Sat" and "9:00 AM".';
+            } else {
+              const over = {};
+              const pl = (form.get('pLocation') || '').toString().trim().slice(0, 60);
+              if (pl) {
+                over.location = pl;
+                over.mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(pl)}`;
+              }
+              const pco = parseInt((form.get('pCourts') || '').toString(), 10);
+              if (!Number.isNaN(pco) && pco >= 1 && pco <= 12) over.courts = pco;
+              const ppc = parseInt((form.get('pPerCourt') || '').toString(), 10);
+              if (!Number.isNaN(ppc) && ppc >= 2 && ppc <= 8) over.perCourt = ppc;
+              const proposal = newEvent(group, {
+                date: parsed.date,
+                hour: parsed.hour,
+                label: parsed.label,
+                sfx: shortId(),
+                kind: 'proposed',
+                proposedBy: tgUser.id,
+                proposedByName: who,
+                ...over,
+              });
+              addMember(proposal, from);
+              await saveEvent(env, proposal);
+              await firedOnce(env, `fired:${group.chatId}:${proposal.id}:open`);
+              await tg(env, 'sendMessage', {
+                chat_id: chatConf.chatId,
+                text: `💡 <b>${esc(who)}</b> proposed a game: <b>${fmtGameDate(proposal.date)}, ${proposal.label}</b> at ${esc(proposal.location)}. Who's in?`,
+                parse_mode: 'HTML',
+              });
+              await refreshRoster(env, chatConf.chatId, proposal, { repost: true });
+              await saveEvent(env, proposal);
+              week = proposal; // land the browser on the new game's page
+              note = `Proposed! ${fmtGameDate(proposal.date)}, ${proposal.label} — you're in.`;
+            }
+          } else if (action === 'guest' && isFull(week)) {
             note = `All ${week.courts} courts are full (${maxPlayers(week)} players).`;
           } else if (action === 'in' && isFull(week)) {
             note = `All ${week.courts} courts are full (${maxPlayers(week)} players).`;
@@ -2595,7 +2717,7 @@ export default {
             await saveEvent(env, week);
             await postChange(env, chatConf.chatId, week, announce ? `${announce}\n${headcountLine(week)}` : null);
           }
-          return new Response(signupPageHtml(week, note, viewer), {
+          return new Response(signupPageHtml(week, note, viewer, allEvents), {
             headers: { 'content-type': 'text/html; charset=utf-8' },
           });
         }
@@ -2606,7 +2728,7 @@ export default {
         return Response.redirect(`${url.origin}/signup`, 303);
       }
 
-      return new Response(signupPageHtml(week, url.searchParams.get('done') || ''), {
+      return new Response(signupPageHtml(week, url.searchParams.get('done') || '', null, allEvents), {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       });
     }
@@ -2624,5 +2746,5 @@ export {
   groupPlayersIntoCourts, rosterText, describeCascade, localParts, lastCallState,
   eventSlots, addDays, maxPlayers, isFull, joinOutcome, headcountLine,
   nextOccurrence, eventId, newEvent, parsePropose, ensurePids, channelFor,
-  smsText, CONFIG,
+  smsText, encodeStartParam, decodeStartParam, CONFIG,
 };
