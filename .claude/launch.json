@@ -1,0 +1,68 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "worker-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "port": 8787
+    },
+    {
+      "name": "social-app-web",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-social/app' && npx expo start --web --port 8081"
+      ],
+      "port": 8081
+    },
+    {
+      "name": "social-app-local-api",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-social/app' && EXPO_PUBLIC_API_URL=http://localhost:8788 npx expo start --web --port 8081"
+      ],
+      "port": 8081
+    },
+    {
+      "name": "design-sheets",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-social/design/prototype-kitchenline' && python3 -m http.server 8092"
+      ],
+      "port": 8092
+    },
+    {
+      "name": "design-journeys",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-social/design/journeys' && python3 -m http.server 8093"
+      ],
+      "port": 8093
+    },
+    {
+      "name": "social-api-dev",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-social/server' && npx wrangler dev --port 8787"
+      ],
+      "port": 8787
+    },
+    {
+      "name": "billers-web",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd '/Users/johnmartin/Vibe Projects/pickleball-score-generator/pickleball_stats' && flutter run -d web-server --web-port=5001 --dart-define=SCHEDULE_FIRST_HOME=true --dart-define=SCHEDULE_FIRESTORE=true"
+      ],
+      "port": 5001
+    }
+  ]
+}
