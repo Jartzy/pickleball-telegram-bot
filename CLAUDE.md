@@ -2,6 +2,14 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Social-app work has moved
+
+**The pickleball-social product work and its issues now live in `../pickleball-social`**
+(Expo app, Cloudflare Worker API, Firebase functions, contract, design). The beads issues
+for that product were migrated there on 2026-08-14 — start sessions for social-app work in
+that repo. This repo's tracker now only covers the Telegram bots (Whitney bot, singles bot,
+Mini App, and their engagement features).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
